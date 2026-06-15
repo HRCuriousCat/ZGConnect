@@ -1,0 +1,19 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 45da6d221b789ac4f8004fd514c68aa1, type: 3}
+  m_Name: Vegetation Species Set - Birch
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.VegetationSpeciesSet
+  prototypes:
+  - {fileID: 11400000, guid: 5bf4d4819949a384290d150b3a1b3ca2, type: 2}
+  - {fileID: 11400000, guid: bc6d5002e3f476742beb6c87c3e29f11, type: 2}
+  - {fileID: 11400000, guid: 81f87239bc8b76648876ee7d471e1d2a, type: 2}
+  weights: []

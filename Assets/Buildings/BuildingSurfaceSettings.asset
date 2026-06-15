@@ -1,0 +1,67 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b4626319bc13db74597651a4259a6c77, type: 3}
+  m_Name: BuildingSurfaceSettings
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.BuildingSurfaceSettings
+  wallMaxNormalY: 0.25
+  flatRoofMinNormalY: 0.92
+  debugSurfaceUv: 0
+  houseProfile:
+    category: 0
+    maxFloorsInTexture: 3
+    textureWidth: 512
+    textureHeight: 512
+    horizontalMetersPerRepeat: 3
+    metersPerFloor: 3
+    facadeVariants:
+    - material: {fileID: 2100000, guid: b5713943796261049a4273b1bc8236d5, type: 2}
+    flatRoofMetersPerTile: 10
+    flatRoofVariants:
+    - material: {fileID: 2100000, guid: 06835282925d0b64ab11b7c4d4fa8600, type: 2}
+    slopedRoofMetersPerTile: 10
+    slopedRoofVariants:
+    - material: {fileID: 2100000, guid: cc05542d82beee1498d273a435114323, type: 2}
+  midRiseProfile:
+    category: 1
+    maxFloorsInTexture: 7
+    textureWidth: 512
+    textureHeight: 1024
+    horizontalMetersPerRepeat: 3
+    metersPerFloor: 3
+    facadeVariants:
+    - material: {fileID: 2100000, guid: 0dada9cce92b9534ba74ea1f48b3bc71, type: 2}
+    - material: {fileID: 2100000, guid: 8b1f875b1352b534bbf5af24c73b590c, type: 2}
+    - material: {fileID: 2100000, guid: 9228fcb9d2ce7a546a020bc54a1b4ea3, type: 2}
+    - material: {fileID: 2100000, guid: 040594d3dd3033448a506b23a1492ba0, type: 2}
+    flatRoofMetersPerTile: 10
+    flatRoofVariants:
+    - material: {fileID: 2100000, guid: 0b66a489a94bb6840b4822f78b212878, type: 2}
+    slopedRoofMetersPerTile: 10
+    slopedRoofVariants:
+    - material: {fileID: 2100000, guid: 1c6eb1d419c49d546a81dff62963a9cb, type: 2}
+  highRiseProfile:
+    category: 2
+    maxFloorsInTexture: 16
+    textureWidth: 512
+    textureHeight: 2048
+    horizontalMetersPerRepeat: 2.5
+    metersPerFloor: 3
+    facadeVariants:
+    - material: {fileID: 2100000, guid: c3dc782010175294f9e27497bfc1f8a9, type: 2}
+    - material: {fileID: 2100000, guid: d09ce12e550b22c4ab7b0afd519dfa13, type: 2}
+    - material: {fileID: 2100000, guid: a0d5985f8499da44fa6d910ed30eab04, type: 2}
+    flatRoofMetersPerTile: 10
+    flatRoofVariants:
+    - material: {fileID: 2100000, guid: 4332fc4a390054c4fa36bc00307dcd8e, type: 2}
+    slopedRoofMetersPerTile: 10
+    slopedRoofVariants:
+    - material: {fileID: 2100000, guid: 0d1d1a597515270419461a9a7af59f3f, type: 2}

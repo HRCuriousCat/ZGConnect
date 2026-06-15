@@ -1,0 +1,33 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: eb484aaca7479b5429eb1a393308c03f, type: 3}
+  m_Name: PhotogrammetryLodProfile_Default
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.PhotogrammetryStreaming.PhotogrammetryLodProfile
+  maximumScreenSpaceError: 16
+  culledScreenSpaceError: 64
+  maximumSimultaneousTileLoads: 8
+  loadingDescendantLimit: 20
+  skipLevels: 0
+  enableFrustumCulling: 1
+  enableFogCulling: 0
+  regionClipEnabled: 1
+  maxFocusRadiusM: 6000
+  maxGlbTilesPerCollect: 48
+  preloadRadiusM: 1500
+  unloadRadiusM: 2000
+  maxCachedBytes: 536870912
+  enableDiskCache: 1
+  maxDiskCacheBytes: 2147483648
+  diskCacheTtlHours: 48
+  maxTileFinalizesPerFrame: 2
+  tileFinalizeMsBudget: 8
+  maxRefinementDepth: 20

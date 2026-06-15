@@ -1,0 +1,962 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace ZGConnect
+{
+    public enum TerrainQualityPreset
+    {
+        /// <summary>Integrated GPU / laptop — up to 4 tiles, aggressive LOD.</summary>
+        Low    = 0,
+        /// <summary>Mid-range discrete GPU (4–8 GB VRAM) — up to 9 tiles.</summary>
+        Medium = 1,
+        /// <summary>High-end GPU (12+ GB VRAM) — up to 16 tiles, fine LOD.</summary>
+        High   = 2,
+        /// <summary>All settings taken from the manual inspector fields below.</summary>
+        Custom = 3,
+    }
+
+    /// <summary>
+    /// Streams terrain tiles in and out based on camera proximity.
+    ///
+    /// Two modes, selected automatically per tile:
+    ///
+    ///   SetActive mode  — tile has a pre-placed scene object (record.sceneObject != null).
+    ///                     The existing GameObject is simply shown/hidden.
+    ///                     Used when you import with "Create Scene Objects" enabled,
+    ///                     or after clicking "Instantiate All Terrains" in the inspector.
+    ///
+    ///   Runtime mode    — tile has no scene object (record.sceneObject == null).
+    ///                     A terrain GameObject is instantiated from record.terrainData
+    ///                     when the tile enters the load radius, and destroyed when it
+    ///                     leaves the unload radius.  No scene setup required.
+    ///
+    /// Both modes can coexist in the same dataset.
+    ///
+    /// Setup (runtime mode):
+    ///   1. Import terrain — "Create Scene Objects" can be OFF.
+    ///   2. Add this component to any persistent GameObject.
+    ///   3. Assign the CityDataset asset.
+    ///   4. Press Play → streaming begins automatically (or call StartStreaming()).
+    ///
+    /// Setup (SetActive mode):
+    ///   1. Import terrain with "Create Scene Objects" ON, OR click
+    ///      "Instantiate All Terrains" in this component's inspector.
+    ///   2. Same steps 2–4 above.
+    /// </summary>
+    [DisallowMultipleComponent]
+    public class TerrainStreamingController : MonoBehaviour
+    {
+        [Header("Dataset")]
+        [SerializeField] private CityDataset dataset;
+        [SerializeField] private Transform   cameraTransform;
+
+		[Header("Terrain Rendering")]
+		[SerializeField] private Material terrainMaterial;
+		
+        [Header("Radii (meters)")]
+        [Tooltip("Tiles whose nearest edge is within this distance will be loaded.")]
+        [SerializeField] private float loadRadius   = 3000f;
+        [Tooltip("Tiles whose nearest edge exceeds this distance will be unloaded. " +
+                 "Must be greater than Load Radius to create a hysteresis band.")]
+        [SerializeField] private float unloadRadius = 5000f;
+
+        [Header("Performance")]
+        [Tooltip("Seconds between streaming evaluation passes.")]
+        [SerializeField] private float checkInterval = 0.5f;
+
+        [Tooltip("Low = integrated GPU (4 tiles, coarse LOD).  Medium = mid-range discrete GPU (9 tiles).  " +
+                 "High = 12+ GB VRAM (16 tiles, fine LOD).  Custom = use the manual fields below.")]
+        [SerializeField] private TerrainQualityPreset qualityPreset = TerrainQualityPreset.Medium;
+
+        [Tooltip("Maximum number of terrain tiles that may be loaded (active + pending) at once. " +
+                 "Ignored unless Quality Preset is Custom. " +
+                 "Each tile can consume 15–80 MB of VRAM depending on basemap type and resolution.")]
+        [SerializeField] private int maxLoadedTiles = 9;
+
+        [Header("Runtime Terrain Root")]
+        [Tooltip("Parent for runtime-instantiated terrain tiles. " +
+                 "Auto-created as 'ZG Connect Terrains (Runtime)' if left empty.")]
+        [SerializeField] private Transform terrainRoot;
+
+        [Header("Terrain Quality (Runtime Mode)")]
+        [Tooltip("drawInstanced setting applied to runtime-instantiated terrains.")]
+        [SerializeField] private bool  drawInstanced   = true;
+        [Tooltip("heightmapPixelError applied to runtime-instantiated terrains.")]
+        [SerializeField] private float pixelError       = 5f;
+        [Tooltip("basemapDistance applied to runtime-instantiated terrains.")]
+        [SerializeField] private int   basemapDistance  = 1000;
+
+        [Header("Buildings")]
+        [Tooltip("When enabled, building groups are streamed alongside their terrain tile.\n" +
+                 "Prefab-based buildings (buildingsLod0Prefab set) are Instantiated on load " +
+                 "and Destroyed on unload. Legacy scene-object buildings (buildingsSceneObject) " +
+                 "fall back to SetActive toggling.")]
+        [SerializeField] private bool streamBuildings = true;
+
+        [Tooltip("Parent transform for instantiated building groups. " +
+                 "Auto-created as 'ZG Connect Buildings (Runtime)' if not assigned.")]
+        [SerializeField] private Transform buildingsRoot;
+
+        [Tooltip("Seconds an unloaded building group stays in memory (inactive) before being destroyed. " +
+                 "Allows instant re-activation if the camera returns within this window.")]
+        [SerializeField] private float buildingDestroyDelay = 30f;
+
+        [Tooltip("Maximum number of inactive building groups kept in memory during the grace period. " +
+                 "When the cap is reached the oldest group is destroyed immediately regardless of delay.")]
+        [SerializeField] private int maxInactiveBuildingGroups = 10;
+
+        [Header("Vegetation")]
+        [Tooltip("When enabled, vegetation chunks are generated and destroyed alongside terrain tiles.")]
+        [SerializeField] private bool streamVegetation = true;
+
+        [Tooltip("Global vegetation rule set shared across all tiles.")]
+        [SerializeField] private VegetationRuleSet vegetationRuleSet;
+
+        [Tooltip("All vegetation prototypes (mesh + material definitions). " +
+                 "VegetationRule species sets must reference prototypes from this array.")]
+        [SerializeField] private VegetationPrototype[] vegetationPrototypes;
+
+        [Header("Start Position")]
+        [Tooltip("When enabled, the camera is teleported to the centre of the dataset on Start.\n" +
+                 "Useful when your scene camera starts far from the tile grid.")]
+        [SerializeField] private bool  teleportCameraOnStart  = false;
+        [Tooltip("Camera height above the dataset's maximum terrain height after teleport.")]
+        [SerializeField] private float teleportHeightOffset   = 300f;
+
+        [Header("HUD")]
+        [SerializeField] private bool showHUD = true;
+
+        // ── Private state ──────────────────────────────────────────────────────
+        private Transform _cam;
+        private Camera    _camComponent;
+        private float     _nextCheckTime;
+        private bool      _isStreaming;
+        private bool      _initialized;
+
+        private int _loadedCount;
+        private int _pendingCount;   // kept for HUD compatibility; direct TerrainData loading is synchronous
+        private int _totalCount;
+        private int _visibleBuildingCount;
+
+        // GPS readout — updated every frame
+        private (double lat, double lon) _cameraGPS;
+        private (double lat, double lon) _mouseGPS;
+        private float _cameraAlt;
+        private float _mouseAlt;
+        private bool  _mouseOnTerrain;
+
+        // Runtime-mode: terrain GameObjects instantiated by this controller.
+        // Separate from record.sceneObject (the importer's static reference).
+        private readonly Dictionary<string, GameObject> _runtimeTerrainObjects =
+            new Dictionary<string, GameObject>();
+
+        // Used by RewireNeighbors — rebuilt each pass.
+        private readonly Dictionary<string, Terrain> _activeTerrainsById =
+            new Dictionary<string, Terrain>();
+
+        // Prefab-based building instances keyed by tileId.
+        private readonly Dictionary<string, GameObject> _activeBuildingObjects =
+            new Dictionary<string, GameObject>();
+
+        // Building groups deactivated but not yet destroyed (grace period).
+        private readonly Dictionary<string, GameObject> _inactiveBuildingObjects =
+            new Dictionary<string, GameObject>();
+        private readonly Dictionary<string, float> _buildingDeactivationTimes =
+            new Dictionary<string, float>();
+
+        private readonly Dictionary<string, VegetationChunkRenderer> _activeVegetation =
+            new Dictionary<string, VegetationChunkRenderer>();
+
+        private VegetationInstanceGenerator _vegetationGenerator;
+
+        private int _streamingMipmapsBudgetMB = 512;
+
+        private GUIStyle _hudStyle;
+        private GUIStyle _hudShadowStyle;
+
+        // ── Public API ─────────────────────────────────────────────────────────
+
+        /// <summary>Whether the streaming loop is currently running.</summary>
+        public bool IsStreaming => _isStreaming;
+
+        /// <summary>Number of terrain tiles currently active.</summary>
+        public int LoadedCount => _loadedCount;
+
+        /// <summary>Number of building GameObjects currently visible across all active tiles.</summary>
+        public int VisibleBuildingCount => _visibleBuildingCount;
+
+        /// <summary>
+        /// Begins streaming. Runs an immediate evaluation pass then continues
+        /// checking every <c>checkInterval</c> seconds.
+        /// Safe to call multiple times — subsequent calls only reset the timer.
+        /// </summary>
+        public void StartStreaming()
+        {
+            if (!EnsureInitialized()) return;
+
+            _isStreaming   = true;
+            _nextCheckTime = 0f;   // force an immediate pass on the next Update
+
+            Debug.Log("[ZGConnect] Terrain streaming started.");
+        }
+
+        /// <summary>
+        /// Stops the streaming loop.
+        /// Runtime-instantiated terrain tiles are destroyed.
+        /// SetActive-mode tiles remain in their current state.
+        /// Call StartStreaming() to resume.
+        /// </summary>
+        public void StopStreaming()
+        {
+            _isStreaming = false;
+
+            // Destroy all runtime-instantiated terrain tiles
+            foreach (var kvp in _runtimeTerrainObjects)
+                if (kvp.Value != null) Destroy(kvp.Value);
+            _runtimeTerrainObjects.Clear();
+
+            // Destroy runtime building instances (active and grace-period inactive)
+            foreach (var kvp in _activeBuildingObjects)
+                if (kvp.Value != null) Destroy(kvp.Value);
+            _activeBuildingObjects.Clear();
+
+            foreach (var kvp in _inactiveBuildingObjects)
+                if (kvp.Value != null) Destroy(kvp.Value);
+            _inactiveBuildingObjects.Clear();
+            _buildingDeactivationTimes.Clear();
+
+            foreach (var kvp in _activeVegetation)
+                if (kvp.Value != null) kvp.Value.Clear();
+            _activeVegetation.Clear();
+
+            _loadedCount = 0;
+
+            Debug.Log("[ZGConnect] Terrain streaming stopped.");
+        }
+
+        // ──────────────────────────────────────────────────────────────────────
+
+        private void Start()
+        {
+            // Eagerly resolve all scene references so inspector fields are
+            // populated from frame one — no lazy surprises mid-session.
+            EnsureTerrainRoot();
+            EnsureBuildingsRoot();
+
+            if (EnsureInitialized())
+            {
+                if (teleportCameraOnStart)
+                    TeleportCameraToDatasetCenter();
+
+                StartStreaming();
+            }
+        }
+
+        private void Update()
+        {
+            // GPS readout — every frame regardless of tile check interval
+            if (_initialized && _cam != null)
+                UpdateGPS();
+
+            if (!_isStreaming) return;
+            if (Time.time < _nextCheckTime) return;
+
+            _nextCheckTime = Time.time + checkInterval;
+            EvaluateTiles();
+        }
+
+        private void UpdateGPS()
+        {
+            _cameraGPS = ZGConnectCoordinates.UnityToWGS84(_cam.position);
+            _cameraAlt = ZGConnectCoordinates.UnityYToElevation(_cam.position.y);
+
+            // Mouse → terrain raycast
+            Camera cam = _camComponent != null ? _camComponent : Camera.main;
+            if (cam == null) { _mouseOnTerrain = false; return; }
+
+#if ENABLE_INPUT_SYSTEM
+            Vector2 mouseScreen = UnityEngine.InputSystem.Mouse.current?.position.ReadValue() ?? Vector2.zero;
+#else
+            Vector2 mouseScreen = Input.mousePosition;
+#endif
+            Ray ray = cam.ScreenPointToRay(mouseScreen);
+            if (Physics.Raycast(ray, out RaycastHit hit, float.PositiveInfinity))
+            {
+                if (hit.collider is TerrainCollider)
+                {
+                    _mouseGPS      = ZGConnectCoordinates.UnityToWGS84(hit.point);
+                    _mouseAlt      = ZGConnectCoordinates.UnityYToElevation(hit.point.y);
+                    _mouseOnTerrain = true;
+                    return;
+                }
+            }
+            _mouseOnTerrain = false;
+        }
+
+        // ── Initialisation ─────────────────────────────────────────────────────
+
+        private void ApplyQualityPreset()
+        {
+            switch (qualityPreset)
+            {
+                case TerrainQualityPreset.Low:
+                    maxLoadedTiles           = 16;
+                    pixelError               = 15f;
+                    basemapDistance          = 500;
+                    _streamingMipmapsBudgetMB = 256;
+                    break;
+                case TerrainQualityPreset.Medium:
+                    maxLoadedTiles           = 48;
+                    pixelError               = 7f;
+                    basemapDistance          = 1000;
+                    _streamingMipmapsBudgetMB = 512;
+                    break;
+                case TerrainQualityPreset.High:
+                    maxLoadedTiles           = 128;
+                    pixelError               = 3f;
+                    basemapDistance          = 2000;
+                    _streamingMipmapsBudgetMB = 1024;
+                    break;
+                case TerrainQualityPreset.Custom:
+                    break;  // leave all fields as-is
+            }
+
+            // Enable Unity's texture mipmap streaming so distant tiles automatically
+            // use lower-resolution mips — this is what the editor does implicitly.
+            QualitySettings.streamingMipmapsActive            = true;
+            QualitySettings.streamingMipmapsMemoryBudget       = _streamingMipmapsBudgetMB;
+            QualitySettings.streamingMipmapsMaxLevelReduction = 6;   // allow dropping up to 6 mip levels
+        }
+
+        private bool EnsureInitialized()
+        {
+            if (_initialized) return true;
+
+            // Resolve and persist camera reference so it shows in the inspector.
+            if (cameraTransform == null)
+                cameraTransform = Camera.main?.transform;
+
+            _cam = cameraTransform;
+
+            if (_cam == null)
+            {
+                Debug.LogError("[ZGConnect] TerrainStreamingController: no camera found. " +
+                               "Assign Camera Transform or ensure Camera.main exists.");
+                return false;
+            }
+
+            if (dataset == null)
+            {
+                Debug.LogError("[ZGConnect] TerrainStreamingController: CityDataset not assigned.");
+                return false;
+            }
+
+            ApplyQualityPreset();
+
+            _totalCount    = dataset.tiles.Count;
+            _camComponent  = cameraTransform?.GetComponent<Camera>();
+
+            // Configure coordinate converter.
+            // Prefer dataset.unityOrigin; if it is zero (dataset imported before
+            // the field existed) derive the origin from the first tile instead:
+            //   originX = tile.left   − tile.unityPosition.x
+            //   originY = tile.bottom − tile.unityPosition.z
+            int originX = dataset.unityOrigin.x;
+            int originY = dataset.unityOrigin.y;
+
+            if (originX == 0 && originY == 0 &&
+                dataset.tiles != null && dataset.tiles.Count > 0)
+            {
+                CityTileRecord t0 = dataset.tiles[0];
+                originX = Mathf.RoundToInt(t0.left   - t0.unityPosition.x);
+                originY = Mathf.RoundToInt(t0.bottom - t0.unityPosition.z);
+                Debug.Log($"[ZGConnect] Derived coordinate origin from tile data: ({originX}, {originY}). " +
+                          "Re-import the dataset to persist this value in dataset.unityOrigin.");
+            }
+
+            ZGConnectCoordinates.Configure(originX, originY, dataset.minHeight);
+
+            _initialized = true;
+            return true;
+        }
+
+        // ── Core evaluation ────────────────────────────────────────────────────
+
+        private void EvaluateTiles()
+        {
+            Vector3 camPos   = _cam.position;
+            int     tileSize = dataset.tileSizeMeters;
+            bool    anyChanged = false;
+            int     loaded     = 0;
+            int     buildings  = 0;
+
+            // ── Pass 1: unload anything beyond unload radius ───────────────────
+            foreach (CityTileRecord record in dataset.tiles)
+            {
+                bool hasData = record.sceneObject != null
+                    || record.terrainData != null;
+                if (!hasData) continue;
+
+                float dist     = TileBoundaryDistance(camPos, record.unityPosition, tileSize);
+                bool  isLoaded = IsTileLoaded(record);
+                if (isLoaded && dist > unloadRadius)
+                {
+                    UnloadTile(record);
+                    if (streamBuildings)  UnloadBuildingGroup(record);
+                    if (streamVegetation) DestroyVegetation(record);
+                    anyChanged = true;
+                }
+            }
+
+            // ── Pass 2: collect candidates inside load radius, sorted by distance ─
+            int slotsUsed = _runtimeTerrainObjects.Count;
+
+            // SetActive-mode tiles don't count against the runtime cap (no VRAM allocation here).
+            var candidates = new System.Collections.Generic.List<(float dist, CityTileRecord record)>();
+
+            foreach (CityTileRecord record in dataset.tiles)
+            {
+                bool hasData = record.sceneObject != null
+                    || record.terrainData != null;
+                if (!hasData) continue;
+
+                float dist      = TileBoundaryDistance(camPos, record.unityPosition, tileSize);
+                bool  isLoaded  = IsTileLoaded(record);
+
+                if (!isLoaded && dist <= loadRadius)
+                    candidates.Add((dist, record));
+            }
+
+            candidates.Sort((a, b) => a.dist.CompareTo(b.dist));
+
+            foreach (var (dist, record) in candidates)
+            {
+                if (slotsUsed >= maxLoadedTiles) break;
+
+                LoadTile(record);
+                // Buildings and vegetation are triggered from LoadTile after the terrain exists.
+                slotsUsed++;
+                anyChanged = true;
+            }
+
+            // ── Pass 3: tally HUD counters ────────────────────────────────────
+            foreach (CityTileRecord record in dataset.tiles)
+            {
+                if (!IsTileLoaded(record)) continue;
+                loaded++;
+
+                if (streamBuildings)
+                {
+                    if (record.buildingsLod0Prefab != null)
+                    {
+                        if (_activeBuildingObjects.TryGetValue(record.tileId, out GameObject bgo))
+                            buildings += bgo != null ? bgo.transform.childCount : 0;
+                    }
+                    else if (record.buildingsSceneObject != null &&
+                             record.buildingsSceneObject.activeSelf)
+                    {
+                        buildings += record.buildingsSceneObject.transform.childCount;
+                    }
+                }
+            }
+
+            _loadedCount          = loaded;
+            _pendingCount         = 0;
+            _visibleBuildingCount = buildings;
+
+            if (anyChanged)
+                RewireNeighbors();
+
+            if (streamBuildings)
+                PruneInactiveBuildings();
+        }
+
+        // ── Tile load / unload ─────────────────────────────────────────────────
+
+        /// <summary>Returns true if the tile terrain is currently active in the scene.</summary>
+        private bool IsTileLoaded(CityTileRecord record)
+        {
+            if (record.sceneObject != null)
+                return record.sceneObject.activeSelf;
+            return _runtimeTerrainObjects.ContainsKey(record.tileId);
+        }
+
+        /// <summary>
+        /// Returns the active terrain GameObject for a tile, or null if not loaded.
+        /// Works for both SetActive and runtime modes.
+        /// </summary>
+        private GameObject GetTileGameObject(CityTileRecord record)
+        {
+            if (record.sceneObject != null)
+                return record.sceneObject.activeSelf ? record.sceneObject : null;
+
+            _runtimeTerrainObjects.TryGetValue(record.tileId, out GameObject go);
+            return go;
+        }
+
+        private void LoadTile(CityTileRecord record)
+        {
+            // SetActive mode: tile was pre-placed in the scene
+            if (record.sceneObject != null)
+            {
+                record.sceneObject.SetActive(true);
+                if (streamBuildings)  LoadBuildingGroup(record);
+                if (streamVegetation) GenerateVegetation(record);
+                return;
+            }
+
+            // Guard against double-load
+            if (_runtimeTerrainObjects.ContainsKey(record.tileId)) return;
+
+            // Runtime mode: instantiate directly from TerrainData already referenced in the dataset.
+            if (record.terrainData != null)
+            {
+                CreateTerrainGameObject(record, record.terrainData);
+                if (streamBuildings)  LoadBuildingGroup(record);
+                if (streamVegetation) GenerateVegetation(record);
+                return;
+            }
+
+            Debug.LogWarning(
+                $"[ZGConnect] Tile '{record.tileId}' has no TerrainData reference. " +
+                "Assign TerrainData directly on the CityTileRecord or use pre-placed scene objects.");
+        }
+
+        /// <summary>
+        /// Creates and registers the terrain GameObject for a tile.
+        /// Called both from the direct TerrainDatas async callback and the legacy sync path.
+        /// </summary>
+        private void CreateTerrainGameObject(CityTileRecord record, TerrainData td)
+        {
+            EnsureTerrainRoot();
+
+            // Scale Unity's internal baked basemap resolution by distance.
+            // This texture is always in VRAM regardless of mipmap streaming —
+            // reducing it for distant tiles saves ~3–12 MB each with no visible impact.
+            float dist = TileBoundaryDistance(_cam != null ? _cam.position : Vector3.zero,
+                                              record.unityPosition, dataset.tileSizeMeters);
+            int baseMapRes = dist < basemapDistance        ? 1024
+                           : dist < basemapDistance * 2f   ?  512
+                                                            :  256;
+            if (td.baseMapResolution != baseMapRes)
+                td.baseMapResolution = baseMapRes;
+
+            GameObject go = Terrain.CreateTerrainGameObject(td);
+            go.name = $"Tile_{record.tileId}";
+            go.transform.SetParent(terrainRoot);
+            go.transform.position = record.unityPosition;
+
+            Terrain terrain = go.GetComponent<Terrain>();
+
+if (terrainMaterial != null)
+{
+    terrain.materialTemplate = terrainMaterial;
+}
+else
+{
+    Debug.LogError("[ZGConnect] No terrain material assigned. Runtime terrain may render pink/invisible in build.");
+}
+
+terrain.drawInstanced       = drawInstanced;
+terrain.heightmapPixelError = pixelError;
+terrain.basemapDistance     = basemapDistance;
+terrain.allowAutoConnect    = false;
+
+            TerrainCollider col = go.GetComponent<TerrainCollider>();
+            if (col != null) col.terrainData = td;
+
+            _runtimeTerrainObjects[record.tileId] = go;
+
+            // Stitch seams with any already-active neighbours
+            RewireNeighbors();
+        }
+
+        private void UnloadTile(CityTileRecord record)
+        {
+            // SetActive mode
+            if (record.sceneObject != null)
+            {
+                record.sceneObject.SetActive(false);
+                return;
+            }
+
+            // Destroy the scene GameObject
+            if (_runtimeTerrainObjects.TryGetValue(record.tileId, out GameObject go))
+            {
+                _runtimeTerrainObjects.Remove(record.tileId);
+                Destroy(go);
+            }
+
+        }
+
+        // ── Neighbour rewiring ─────────────────────────────────────────────────
+
+        private void RewireNeighbors()
+        {
+            _activeTerrainsById.Clear();
+
+            foreach (CityTileRecord record in dataset.tiles)
+            {
+                GameObject go = GetTileGameObject(record);
+                if (go == null) continue;
+
+                Terrain t = go.GetComponent<Terrain>();
+                if (t != null)
+                    _activeTerrainsById[$"{record.left}_{record.bottom}"] = t;
+            }
+
+            int tileSize = dataset.tileSizeMeters;
+
+            foreach (CityTileRecord record in dataset.tiles)
+            {
+                GameObject go = GetTileGameObject(record);
+                if (go == null) continue;
+
+                Terrain t = go.GetComponent<Terrain>();
+                if (t == null) continue;
+
+                _activeTerrainsById.TryGetValue($"{record.left - tileSize}_{record.bottom}", out Terrain left);
+                _activeTerrainsById.TryGetValue($"{record.left + tileSize}_{record.bottom}", out Terrain right);
+                _activeTerrainsById.TryGetValue($"{record.left}_{record.bottom + tileSize}",  out Terrain top);
+                _activeTerrainsById.TryGetValue($"{record.left}_{record.bottom - tileSize}", out Terrain bottom);
+
+                t.SetNeighbors(left, top, right, bottom);
+                t.Flush();
+            }
+        }
+
+        // ── Distance helper ────────────────────────────────────────────────────
+
+        private static float TileBoundaryDistance(Vector3 camPos, Vector3 tileOrigin, int tileSize)
+        {
+            float dx = Mathf.Max(0f, tileOrigin.x - camPos.x, camPos.x - (tileOrigin.x + tileSize));
+            float dz = Mathf.Max(0f, tileOrigin.z - camPos.z, camPos.z - (tileOrigin.z + tileSize));
+            return Mathf.Sqrt(dx * dx + dz * dz);
+        }
+
+        // ── Building streaming helpers ─────────────────────────────────────────
+
+        private void LoadBuildingGroup(CityTileRecord record)
+        {
+            if (record.buildingsLod0Prefab != null)
+            {
+                if (_activeBuildingObjects.ContainsKey(record.tileId))
+                    return;
+
+                // Reactivate from grace period — no Instantiate needed.
+                if (_inactiveBuildingObjects.TryGetValue(record.tileId, out GameObject cached))
+                {
+                    _inactiveBuildingObjects.Remove(record.tileId);
+                    _buildingDeactivationTimes.Remove(record.tileId);
+                    cached.SetActive(true);
+                    _activeBuildingObjects[record.tileId] = cached;
+                    return;
+                }
+
+                EnsureBuildingsRoot();
+                GameObject go = Instantiate(record.buildingsLod0Prefab, buildingsRoot);
+                go.name = $"TileBuildings_{record.tileId}";
+                _activeBuildingObjects[record.tileId] = go;
+                return;
+            }
+
+            if (record.buildingsSceneObject != null)
+                record.buildingsSceneObject.SetActive(true);
+        }
+
+        private void UnloadBuildingGroup(CityTileRecord record)
+        {
+            if (record.buildingsLod0Prefab != null)
+            {
+                if (_activeBuildingObjects.TryGetValue(record.tileId, out GameObject go))
+                {
+                    _activeBuildingObjects.Remove(record.tileId);
+                    go.SetActive(false);
+                    _inactiveBuildingObjects[record.tileId] = go;
+                    _buildingDeactivationTimes[record.tileId] = Time.time;
+                    EnforceInactiveBuildingCap();
+                }
+                return;
+            }
+
+            if (record.buildingsSceneObject != null)
+                record.buildingsSceneObject.SetActive(false);
+        }
+
+        private void PruneInactiveBuildings()
+        {
+            if (_buildingDeactivationTimes.Count == 0) return;
+
+            float now = Time.time;
+            var toDestroy = new System.Collections.Generic.List<string>();
+
+            foreach (var kvp in _buildingDeactivationTimes)
+                if (now - kvp.Value >= buildingDestroyDelay)
+                    toDestroy.Add(kvp.Key);
+
+            foreach (string tileId in toDestroy)
+                DestroyInactiveBuilding(tileId);
+        }
+
+        private void EnforceInactiveBuildingCap()
+        {
+            while (_inactiveBuildingObjects.Count > maxInactiveBuildingGroups)
+            {
+                string oldest = null;
+                float  oldestTime = float.MaxValue;
+
+                foreach (var kvp in _buildingDeactivationTimes)
+                {
+                    if (kvp.Value < oldestTime)
+                    {
+                        oldestTime = kvp.Value;
+                        oldest     = kvp.Key;
+                    }
+                }
+
+                if (oldest == null) break;
+                DestroyInactiveBuilding(oldest);
+            }
+        }
+
+        private void DestroyInactiveBuilding(string tileId)
+        {
+            if (_inactiveBuildingObjects.TryGetValue(tileId, out GameObject go))
+            {
+                _inactiveBuildingObjects.Remove(tileId);
+                if (go != null) Destroy(go);
+            }
+            _buildingDeactivationTimes.Remove(tileId);
+        }
+
+        // ── Vegetation streaming helpers ───────────────────────────────────────
+
+        private void GenerateVegetation(CityTileRecord record)
+        {
+            if (!streamVegetation) return;
+            if (vegetationRuleSet == null) return;
+            if (vegetationPrototypes == null || vegetationPrototypes.Length == 0) return;
+            if (record.vegetationMask == null) return;
+            if (_activeVegetation.ContainsKey(record.tileId)) return;
+
+            GameObject tileGo = GetTileGameObject(record);
+            if (tileGo == null) return;
+
+            Terrain terrain = tileGo.GetComponent<Terrain>();
+
+            int   size  = dataset.tileSizeMeters;
+            float halfY = (dataset.maxHeight - dataset.minHeight) * 0.5f;
+            float midY  = dataset.minHeight + halfY;
+
+            var bounds = new Bounds(
+                new Vector3(record.unityPosition.x + size * 0.5f, midY, record.unityPosition.z + size * 0.5f),
+                new Vector3(size, halfY * 2f, size)
+            );
+
+            if (_vegetationGenerator == null)
+                _vegetationGenerator = new VegetationInstanceGenerator();
+
+            VegetationChunk vchunk = _vegetationGenerator.GenerateChunk(
+                record.tileId,
+                bounds,
+                record.vegetationMask,
+                vegetationRuleSet,
+                vegetationPrototypes,
+                terrain
+            );
+
+            VegetationChunkRenderer renderer = tileGo.GetComponent<VegetationChunkRenderer>();
+            if (renderer == null)
+                renderer = tileGo.AddComponent<VegetationChunkRenderer>();
+
+            renderer.SetChunk(vchunk, vegetationPrototypes);
+            _activeVegetation[record.tileId] = renderer;
+        }
+
+        private void DestroyVegetation(CityTileRecord record)
+        {
+            if (_activeVegetation.TryGetValue(record.tileId, out VegetationChunkRenderer renderer))
+            {
+                if (renderer != null) renderer.Clear();
+                _activeVegetation.Remove(record.tileId);
+            }
+        }
+
+        // ── Camera positioning ─────────────────────────────────────────────────
+
+        /// <summary>
+        /// Returns the world-space centre of the dataset tile grid (XZ midpoint,
+        /// Y = <c>dataset.maxHeight + teleportHeightOffset</c>).
+        /// Returns <c>Vector3.zero</c> if the dataset has no valid tiles.
+        /// </summary>
+        public Vector3 GetDatasetCenter()
+        {
+            if (dataset?.tiles == null || dataset.tiles.Count == 0) return Vector3.zero;
+
+            float minX = float.MaxValue, minZ = float.MaxValue;
+            float maxX = float.MinValue, maxZ = float.MinValue;
+
+            foreach (CityTileRecord tile in dataset.tiles)
+            {
+                // Accept tiles with either a direct TerrainData reference or a pre-placed scene object.
+                bool hasTd = tile.terrainData != null
+                          || tile.sceneObject != null;
+                if (!hasTd) continue;
+                float x1 = tile.unityPosition.x;
+                float z1 = tile.unityPosition.z;
+                float x2 = x1 + dataset.tileSizeMeters;
+                float z2 = z1 + dataset.tileSizeMeters;
+                if (x1 < minX) minX = x1;
+                if (z1 < minZ) minZ = z1;
+                if (x2 > maxX) maxX = x2;
+                if (z2 > maxZ) maxZ = z2;
+            }
+
+            if (minX == float.MaxValue) return Vector3.zero;
+
+            return new Vector3(
+                (minX + maxX) * 0.5f,
+                dataset.maxHeight + teleportHeightOffset,
+                (minZ + maxZ) * 0.5f
+            );
+        }
+
+        /// <summary>
+        /// Moves the camera to <see cref="GetDatasetCenter"/> and angles it 45° downward.
+        /// Safe to call from scripts or editor buttons at any time.
+        /// </summary>
+        public void TeleportCameraToDatasetCenter()
+        {
+            if (_cam == null)
+            {
+                Debug.LogWarning("[ZGConnect] TeleportCameraToDatasetCenter: no camera assigned.");
+                return;
+            }
+
+            Vector3 centre = GetDatasetCenter();
+            if (centre == Vector3.zero)
+            {
+                Debug.LogWarning("[ZGConnect] TeleportCameraToDatasetCenter: dataset has no tiles with TerrainData.");
+                return;
+            }
+
+            _cam.position = centre;
+            _cam.rotation = Quaternion.Euler(45f, 0f, 0f);
+
+            Debug.Log($"[ZGConnect] Camera teleported to dataset centre " +
+                      $"({centre.x:F0}, {centre.y:F0}, {centre.z:F0}).");
+        }
+
+        // ── Root helpers ───────────────────────────────────────────────────────
+
+        private void EnsureTerrainRoot()
+        {
+            if (terrainRoot != null) return;
+            terrainRoot = new GameObject("ZG Connect Terrains (Runtime)").transform;
+        }
+
+        private void EnsureBuildingsRoot()
+        {
+            if (buildingsRoot != null) return;
+            buildingsRoot = new GameObject("ZG Connect Buildings (Runtime)").transform;
+        }
+
+        // ── Lifecycle ──────────────────────────────────────────────────────────
+
+        private void OnDestroy()
+        {
+            foreach (var kvp in _runtimeTerrainObjects)
+                if (kvp.Value != null) Destroy(kvp.Value);
+            _runtimeTerrainObjects.Clear();
+
+            foreach (var kvp in _activeBuildingObjects)
+                if (kvp.Value != null) Destroy(kvp.Value);
+            _activeBuildingObjects.Clear();
+
+            foreach (var kvp in _inactiveBuildingObjects)
+                if (kvp.Value != null) Destroy(kvp.Value);
+            _inactiveBuildingObjects.Clear();
+            _buildingDeactivationTimes.Clear();
+
+            foreach (var kvp in _activeVegetation)
+                if (kvp.Value != null) kvp.Value.Clear();
+            _activeVegetation.Clear();
+        }
+
+        private void OnValidate()
+        {
+            if (unloadRadius <= loadRadius)
+                unloadRadius = loadRadius + 500f;
+
+#if UNITY_EDITOR
+            // Auto-assign Camera.main if cameraTransform is not set.
+            // Runs whenever the component is first added or any inspector field changes.
+            if (cameraTransform == null && Camera.main != null)
+            {
+                cameraTransform = Camera.main.transform;
+                UnityEditor.EditorUtility.SetDirty(this);
+            }
+#endif
+        }
+
+        // ── HUD ────────────────────────────────────────────────────────────────
+
+        private void OnGUI()
+        {
+            if (!showHUD) return;
+            EnsureHUDStyles();
+
+            // Build lines in bottom-to-top order
+            var lines = new System.Collections.Generic.List<string>(6);
+
+            // Row 1 (bottom): tile streaming status
+            string status     = _isStreaming ? "streaming" : "stopped";
+            string loadingStr = _pendingCount > 0 ? $"  ({_pendingCount} loading…)" : "";
+            lines.Add(_isStreaming
+                ? $"Tiles  {_loadedCount} / {_totalCount}  loaded{loadingStr}  (cap {maxLoadedTiles})   |   load {loadRadius:F0} m  ·  unload {unloadRadius:F0} m"
+                : $"Tiles  {_loadedCount} / {_totalCount}  loaded   |   {status}");
+
+            // Row 2: buildings (optional)
+            if (streamBuildings && _visibleBuildingCount > 0)
+                lines.Add($"Buildings  {_visibleBuildingCount:N0}  visible");
+
+            // Rows 3–4: GPS coordinates
+            if (ZGConnectCoordinates.IsConfigured)
+            {
+                if (_mouseOnTerrain)
+                    lines.Add($"Cursor   {ZGConnectCoordinates.Format(_mouseGPS.lat, _mouseGPS.lon)}   {_mouseAlt:F0} m");
+
+                lines.Add($"Camera   {ZGConnectCoordinates.Format(_cameraGPS.lat, _cameraGPS.lon)}   {_cameraAlt:F0} m");
+            }
+
+            // Render bottom-up
+            float w = Screen.width - 20f;
+            float h = 22f;
+            float y = Screen.height - 14f - h;
+
+            foreach (string line in lines)
+            {
+                var r = new Rect(10f, y, w, h);
+                GUI.Label(new Rect(r.x + 1f, r.y + 1f, r.width, r.height), line, _hudShadowStyle);
+                GUI.Label(r, line, _hudStyle);
+                y -= h;
+            }
+        }
+
+        private void EnsureHUDStyles()
+        {
+            if (_hudStyle != null) return;
+
+            _hudStyle = new GUIStyle(GUI.skin.label)
+            {
+                fontSize  = 12,
+                fontStyle = FontStyle.Bold,
+                normal    = { textColor = Color.white }
+            };
+            _hudShadowStyle = new GUIStyle(_hudStyle)
+            {
+                normal = { textColor = new Color(0f, 0f, 0f, 0.8f) }
+            };
+        }
+    }
+}

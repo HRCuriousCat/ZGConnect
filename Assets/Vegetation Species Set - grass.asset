@@ -1,0 +1,19 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 45da6d221b789ac4f8004fd514c68aa1, type: 3}
+  m_Name: Vegetation Species Set - grass
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.VegetationSpeciesSet
+  prototypes:
+  - {fileID: 11400000, guid: ad06533a7f552d640988e7c579c80bb9, type: 2}
+  - {fileID: 11400000, guid: c2fdc7fbc4373ec42ad83bba56346b32, type: 2}
+  - {fileID: 11400000, guid: b091c9c62bdfef243ac604a2c4860582, type: 2}
+  weights: []

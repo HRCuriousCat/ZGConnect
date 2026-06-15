@@ -1,0 +1,26 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 853ac7ac2ad5c6f4792aae6d4959fa0c, type: 3}
+  m_Name: Vegetation Prototype - Grass_B
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.VegetationPrototype
+  prototypeId: 
+  mesh: {fileID: 3858195063951271123, guid: b08d31dbcff82194f84aea7dc1b6cc2e, type: 3}
+  materials:
+  - {fileID: 1501351409537430527, guid: b08d31dbcff82194f84aea7dc1b6cc2e, type: 3}
+  minMaxScale: {x: 20, y: 40}
+  yRotationRange: {x: 0, y: 360}
+  minDistanceBetweenInstances: 5
+  alignToTerrainNormal: 0
+  maxSlope: 500
+  localBounds:
+    m_Center: {x: 0, y: 0, z: 0}
+    m_Extent: {x: 5, y: 5, z: 5}

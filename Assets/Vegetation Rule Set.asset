@@ -1,0 +1,19 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b17c7fb1a2c29d64cba8a0a1f94c0a36, type: 3}
+  m_Name: Vegetation Rule Set
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.VegetationRuleSet
+  globalSeed: 12345
+  rules:
+  - {fileID: 11400000, guid: 6d8f8c4740b6d0e4f816f49b312d4ad0, type: 2}
+  - {fileID: 11400000, guid: c274959343a2d1d4ba7b20364d68fc84, type: 2}
+  - {fileID: 11400000, guid: af30f31806e1d424995b3153ead7ac71, type: 2}

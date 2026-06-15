@@ -1,0 +1,27 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 853ac7ac2ad5c6f4792aae6d4959fa0c, type: 3}
+  m_Name: Vegetation Prototype - Birch_B
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.VegetationPrototype
+  prototypeId: 
+  mesh: {fileID: 7935879103911938674, guid: 000e2df8e7b5bf74c9cf596e578b06cd, type: 3}
+  materials:
+  - {fileID: 2100000, guid: 52d35594001cc93438cda6efc6cdf39b, type: 2}
+  - {fileID: 2100000, guid: 094e13c647e2f874f80f5e8df5851ac8, type: 2}
+  minMaxScale: {x: 3, y: 6}
+  yRotationRange: {x: 0, y: 360}
+  minDistanceBetweenInstances: 2
+  alignToTerrainNormal: 0
+  maxSlope: 500
+  localBounds:
+    m_Center: {x: 0, y: 0, z: 0}
+    m_Extent: {x: 5, y: 5, z: 5}
