@@ -43,7 +43,7 @@ namespace ZGConnect.Editor
 
             int height = ZGConnectMapExtent.ExpectedPlaceholderHeight(kWidth);
             var tex = BuildPlaceholderTexture(kWidth, height);
-            File.WriteAllBytes(path, tex.EncodeToPNG());
+            File.WriteAllBytes(path, tex.EncodeToJPG(92));
             Object.DestroyImmediate(tex);
 
             AssetDatabase.Refresh();

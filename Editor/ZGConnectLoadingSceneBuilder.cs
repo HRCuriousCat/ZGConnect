@@ -102,8 +102,7 @@ namespace ZGConnect.Editor
             var bg = CreatePanel(canvas, "Background", new Color(0.07f, 0.08f, 0.10f, 1f), uiSprite);
             StretchFull(bg.GetComponent<RectTransform>());
 
-            Texture2D logo = AssetDatabase.LoadAssetAtPath<Texture2D>(
-                "Assets/ZGConnect/Assets/UI/zg_connect_logo.png");
+            Texture2D logo = ZGConnectEditorBranding.LoadUiLogo();
             if (logo != null)
             {
                 var logoGo = CreatePanel(canvas, "Logo", Color.white, uiSprite);

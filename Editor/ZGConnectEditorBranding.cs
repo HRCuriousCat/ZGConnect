@@ -9,16 +9,26 @@ namespace ZGConnect.Editor
 
         static readonly string[] LogoPaths =
         {
-            "Assets/ZGConnect/Assets/UI/zg_connect_logo editor.png",
-            "Assets/ZGConnect/Assets/UI/zg_connect_logo.png",
+            "Assets/ZGConnect/Assets/UI/zg_connect_logo editor.jpg",
+            "Assets/ZGConnect/Assets/UI/zg_connect_logo UI.jpg",
+        };
+
+        static readonly string[] UiLogoPaths =
+        {
+            "Assets/ZGConnect/Assets/UI/zg_connect_logo UI.jpg",
+            "Assets/ZGConnect/Assets/UI/zg_connect_logo editor.jpg",
         };
 
         static Texture2D _backgroundTexture;
         static GUIStyle _inspectorPanelStyle;
 
-        public static Texture2D LoadLogo()
+        public static Texture2D LoadLogo() => LoadFirstAvailable(LogoPaths);
+
+        public static Texture2D LoadUiLogo() => LoadFirstAvailable(UiLogoPaths);
+
+        static Texture2D LoadFirstAvailable(string[] paths)
         {
-            foreach (string path in LogoPaths)
+            foreach (string path in paths)
             {
                 Texture2D logo = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
                 if (logo != null)
