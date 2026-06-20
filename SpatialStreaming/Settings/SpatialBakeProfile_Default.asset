@@ -1,0 +1,28 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f24fa4bd292556044b308e2a301bbbea, type: 3}
+  m_Name: SpatialBakeProfile_Default
+  m_EditorClassIdentifier: Assembly-CSharp::ZGConnect.SpatialStreaming.SpatialBakeProfile
+  subcellSizeMeters: 250
+  minBuildingsForSubcellSplit: 80
+  maxSubcellsPerEdge: 8
+  combineMeshesPerMaterial: 1
+  combineMaterialOverride: {fileID: 0}
+  deduplicateMaterialsByShader: 1
+  buildingSurfaceSettings: {fileID: 11400000, guid: c6b94bfb1814e024fa92f240ba68c668, type: 2}
+  bakeFootprintProxies: 1
+  bakeSubcellFootprintProxies: 1
+  bakeHlodSupertiles: 1
+  proxyMaterialOverride: {fileID: 0}
+  uncompressedBundles: 0
+  detailBundleMode: 0
+  selectedTileIds: []
