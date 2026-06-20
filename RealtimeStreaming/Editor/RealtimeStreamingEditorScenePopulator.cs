@@ -147,8 +147,7 @@ namespace ZGConnect.RealtimeStreaming.Editor
                 return;
 
             RealtimeStreamingEditorPopulatedTile[] tiles = Object.FindObjectsByType<RealtimeStreamingEditorPopulatedTile>(
-                FindObjectsInactive.Include,
-                FindObjectsSortMode.None);
+                FindObjectsInactive.Include);
             foreach (RealtimeStreamingEditorPopulatedTile tile in tiles)
             {
                 if (tile == null)

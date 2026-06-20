@@ -251,6 +251,20 @@ namespace ZGConnect.RealtimeStreaming.Editor
 
                 return (0, 0, 0, 0);
             };
+            ZGConnectImportRegionBridge.GetBackgroundMapGeorefBounds = () =>
+            {
+                if (RealtimeStreamingMapGeorefUtility.TryGetBackgroundMapGeoref(out ZGConnectMapGeorefBounds bounds))
+                    return (bounds.MinE, bounds.MaxE, bounds.MinN, bounds.MaxN);
+
+                if (RealtimeStreamingMapGeorefUtility.TryGetTileUnion(
+                        RealtimeStreamingManifestMapCache.GetTiles(manifestRelativePath, LoadManifestTilesForMap),
+                        out bounds))
+                {
+                    return (bounds.MinE, bounds.MaxE, bounds.MinN, bounds.MaxN);
+                }
+
+                return (0, 0, 0, 0);
+            };
             ZGConnectImportRegionBridge.GetRegionEpsg = () =>
             {
                 serializedObject.Update();

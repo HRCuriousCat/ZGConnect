@@ -59,6 +59,25 @@ namespace ZGConnect.RealtimeStreaming.Editor
             return true;
         }
 
+        /// <summary>
+        /// Georef for the map background image: full source heightmap metadata when known, else city placeholder.
+        /// </summary>
+        public static bool TryGetBackgroundMapGeoref(out ZGConnectMapGeorefBounds bounds)
+        {
+            if (TryGetHeightmapCoverageFromImporterPrefs(out bounds))
+                return true;
+
+            ZGConnectMapExtent.GetCityBoundingBox(out int minE, out int maxE, out int minN, out int maxN);
+            bounds = new ZGConnectMapGeorefBounds
+            {
+                MinE = minE,
+                MaxE = maxE,
+                MinN = minN,
+                MaxN = maxN,
+            };
+            return true;
+        }
+
         public static bool TryGetHeightmapCoverageFromImporterPrefs(out ZGConnectMapGeorefBounds bounds)
         {
             bounds = default;

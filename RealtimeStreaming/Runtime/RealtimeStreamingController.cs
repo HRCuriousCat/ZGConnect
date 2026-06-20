@@ -4321,8 +4321,7 @@ namespace ZGConnect.RealtimeStreaming
             _editorPopulatedTerrainByKey.Clear();
 
             RealtimeStreamingEditorPopulatedTile[] tiles = FindObjectsByType<RealtimeStreamingEditorPopulatedTile>(
-                FindObjectsInactive.Include,
-                FindObjectsSortMode.None);
+                FindObjectsInactive.Include);
 
             foreach (RealtimeStreamingEditorPopulatedTile tile in tiles)
             {

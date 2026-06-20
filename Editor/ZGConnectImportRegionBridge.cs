@@ -10,8 +10,12 @@ namespace ZGConnect.Editor
     {
         public static Func<List<HeightmapTileJson>> GetTiles;
         /// <summary>
-        /// EPSG bounds of the overview texture (full heightmap metadata coverage).
-        /// When set, map background georef uses this instead of the displayed tile union.
+        /// EPSG bounds of the overview background image (full source heightmap metadata when available).
+        /// Used for texture UV mapping and the Full map view. Independent from the loaded tile grid.
+        /// </summary>
+        public static Func<(int minE, int maxE, int minN, int maxN)> GetBackgroundMapGeorefBounds;
+        /// <summary>
+        /// Optional override for dataset framing bounds. Prefer <see cref="GetTiles"/> tile union when unset.
         /// </summary>
         public static Func<(int minE, int maxE, int minN, int maxN)> GetOverviewGeorefBounds;
         public static Func<(int minE, int maxE, int minN, int maxN)> GetRegionEpsg;
@@ -27,8 +31,9 @@ namespace ZGConnect.Editor
 
         public static void Clear()
         {
-            GetTiles                 = null;
-            GetOverviewGeorefBounds  = null;
+            GetTiles                      = null;
+            GetBackgroundMapGeorefBounds  = null;
+            GetOverviewGeorefBounds       = null;
             GetRegionEpsg            = null;
             ApplyRegionEpsg  = null;
             RepaintImporter  = null;

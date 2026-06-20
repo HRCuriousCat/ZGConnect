@@ -45,22 +45,22 @@ namespace ZGConnect
                 buildingId,
                 building.name,
                 world,
-                building.GetInstanceID());
+                building.GetEntityId());
         }
 
         /// <summary>
-        /// Quantized world position + optional Unity instance id for uniqueness within a tile.
+        /// Quantized world position + optional Unity entity id for uniqueness within a tile.
         /// </summary>
         public static string ComposeVariantSeed(
             string buildingId,
             string objectName,
             Vector3 worldPosition,
-            int unityInstanceId = 0)
+            EntityId unityEntityId = default)
         {
             int qx = Mathf.RoundToInt(worldPosition.x * 100f);
             int qy = Mathf.RoundToInt(worldPosition.y * 10f);
             int qz = Mathf.RoundToInt(worldPosition.z * 100f);
-            string inst = unityInstanceId != 0 ? unityInstanceId.ToString() : "0";
+            string inst = unityEntityId != default ? unityEntityId.ToString() : "0";
             return $"{buildingId ?? ""}|{objectName ?? ""}|{inst}|{qx},{qy},{qz}";
         }
 

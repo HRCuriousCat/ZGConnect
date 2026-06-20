@@ -438,7 +438,7 @@ namespace ZGConnect
             if (_sceneBuildingCache == null ||
                 Time.unscaledTime - _sceneBuildingCacheTime > SceneBuildingCacheLifetime)
             {
-                _sceneBuildingCache = FindObjectsByType<BuildingData>(FindObjectsSortMode.None);
+                _sceneBuildingCache = FindObjectsByType<BuildingData>();
                 _sceneBuildingCacheTime = Time.unscaledTime;
             }
 

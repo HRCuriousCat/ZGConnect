@@ -295,7 +295,7 @@ namespace ZGConnect
             new Dictionary<string, (int, float, int)>();
 
         // Sharpest mip requested per terrain layer texture (shared layers: min mip wins).
-        private readonly Dictionary<int, int> _terrainTextureMipById = new Dictionary<int, int>();
+        private readonly Dictionary<EntityId, int> _terrainTextureMipById = new Dictionary<EntityId, int>();
         private readonly List<Texture2D> _terrainTextureScratch = new List<Texture2D>(16);
 
         private VegetationInstanceGenerator _vegetationGenerator;
@@ -906,7 +906,7 @@ namespace ZGConnect
         {
             if (tex == null || !tex.streamingMipmaps) return;
 
-            int id = tex.GetInstanceID();
+            EntityId id = tex.GetEntityId();
             if (_terrainTextureMipById.TryGetValue(id, out int current))
                 _terrainTextureMipById[id] = Mathf.Min(current, desiredMip);
             else
@@ -937,7 +937,7 @@ namespace ZGConnect
             for (int i = 0; i < _terrainTextureScratch.Count; i++)
             {
                 Texture2D tex = _terrainTextureScratch[i];
-                if (tex == null || !_terrainTextureMipById.TryGetValue(tex.GetInstanceID(), out int mip))
+                if (tex == null || !_terrainTextureMipById.TryGetValue(tex.GetEntityId(), out int mip))
                     continue;
 
                 mip = Mathf.Clamp(mip, 0, Mathf.Max(0, tex.mipmapCount - 1));

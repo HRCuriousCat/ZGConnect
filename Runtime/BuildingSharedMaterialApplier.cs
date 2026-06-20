@@ -197,7 +197,7 @@ namespace ZGConnect
                 Vector3 w = renderer.bounds.size.sqrMagnitude > 1e-8f
                     ? renderer.bounds.center
                     : renderer.transform.position;
-                string slotSeed = variantSeed + "|mr:" + renderer.GetInstanceID()
+                string slotSeed = variantSeed + "|mr:" + renderer.GetEntityId()
                     + "|" + Mathf.RoundToInt(w.x * 100f)
                     + "," + Mathf.RoundToInt(w.z * 100f);
 

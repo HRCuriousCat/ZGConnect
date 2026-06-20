@@ -9,14 +9,14 @@ namespace ZGConnect
     /// </summary>
     public static class VegetationInstancingMaterialCache
     {
-        private static readonly Dictionary<int, Material> CacheBySourceId = new Dictionary<int, Material>();
+        private static readonly Dictionary<EntityId, Material> CacheBySourceId = new Dictionary<EntityId, Material>();
 
         public static Material Get(Material source)
         {
             if (source == null) return null;
             if (source.enableInstancing) return source;
 
-            int key = source.GetInstanceID();
+            EntityId key = source.GetEntityId();
             if (CacheBySourceId.TryGetValue(key, out Material cached) && cached != null)
                 return cached;
 

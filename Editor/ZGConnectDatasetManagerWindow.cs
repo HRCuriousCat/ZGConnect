@@ -188,6 +188,20 @@ namespace ZGConnect.Editor
 
                 return (0, 0, 0, 0);
             };
+            ZGConnectImportRegionBridge.GetBackgroundMapGeorefBounds = () =>
+            {
+                if (RealtimeStreamingMapGeorefUtility.TryGetTileUnion(
+                        ActiveHeightmapSource?.Metadata?.Tiles,
+                        out ZGConnectMapGeorefBounds bounds))
+                {
+                    return (bounds.MinE, bounds.MaxE, bounds.MinN, bounds.MaxN);
+                }
+
+                if (RealtimeStreamingMapGeorefUtility.TryGetBackgroundMapGeoref(out bounds))
+                    return (bounds.MinE, bounds.MaxE, bounds.MinN, bounds.MaxN);
+
+                return (0, 0, 0, 0);
+            };
             ZGConnectImportRegionBridge.GetRegionEpsg = () =>
                 (_regionMinE, _regionMaxE, _regionMinN, _regionMaxN);
             ZGConnectImportRegionBridge.ApplyRegionEpsg = ApplyRegionFromMap;
@@ -1082,10 +1096,8 @@ namespace ZGConnect.Editor
             EditorGUILayout.Space(4);
             EditorGUILayout.LabelField("Scene Setup", EditorStyles.boldLabel);
 
-#pragma warning disable CS0618
             TerrainStreamingController existing =
-                UnityEngine.Object.FindObjectOfType<TerrainStreamingController>();
-#pragma warning restore CS0618
+                UnityEngine.Object.FindAnyObjectByType<TerrainStreamingController>();
 
             if (existing != null)
             {

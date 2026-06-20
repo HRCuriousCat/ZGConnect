@@ -615,7 +615,7 @@ namespace ZGConnect.Editor
                 record.buildingsSceneObject = instance;
 
                 TerrainStreamingController streamer =
-                    UnityEngine.Object.FindFirstObjectByType<TerrainStreamingController>();
+                    UnityEngine.Object.FindAnyObjectByType<TerrainStreamingController>();
                 if (streamer != null)
                     streamer.ApplySharedBuildingMaterials(instance, record);
 
