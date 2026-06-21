@@ -288,17 +288,17 @@ namespace ZGConnect.SpatialStreaming
             int factor)
         {
             int blockSize = tileSizeMeters * factor;
-            int maxBlockRing = factor >= 4 ? rings.Hlod4BandEnd + 1 : rings.Hlod2BandEnd + 1;
-            int camBlockGridX = SpatialTileIdUtility.AlignDownMeters(cameraTile.Left, blockSize) / blockSize;
-            int camBlockGridZ = SpatialTileIdUtility.AlignDownMeters(cameraTile.Bottom, blockSize) / blockSize;
+            int maxBlockRing = SpatialStreamingTileRingUtility.MaxSupertileBlockScanRing(rings, factor);
+            int camBlockLeft = SpatialTileIdUtility.AlignDownMeters(cameraTile.Left, blockSize);
+            int camBlockBottom = SpatialTileIdUtility.AlignDownMeters(cameraTile.Bottom, blockSize);
 
             var seen = new HashSet<string>(StringComparer.Ordinal);
             for (int dz = -maxBlockRing; dz <= maxBlockRing; dz++)
             {
                 for (int dx = -maxBlockRing; dx <= maxBlockRing; dx++)
                 {
-                    int blockLeft = (camBlockGridX + dx) * blockSize;
-                    int blockBottom = (camBlockGridZ + dz) * blockSize;
+                    int blockLeft = camBlockLeft + dx * blockSize;
+                    int blockBottom = camBlockBottom + dz * blockSize;
                     if (!SpatialStreamingTileRingUtility.ShouldWantSupertile(
                             rings, blockLeft, blockBottom, cameraTile, tileSizeMeters, factor) &&
                         !SpatialStreamingTileRingUtility.ShouldQueueSupertile(

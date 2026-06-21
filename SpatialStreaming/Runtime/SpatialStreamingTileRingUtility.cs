@@ -3,8 +3,9 @@ using UnityEngine;
 namespace ZGConnect.SpatialStreaming
 {
     /// <summary>
-    /// Cumulative tile rings from camera tile. Inner rings inherit all outer load layers.
-    /// Load at ring &lt; N, keep loaded at ring &lt; N+1.
+    /// Cumulative tile rings from camera tile. Detail and 1 km coarse layers use cumulative bands
+    /// (load at ring &lt; N, keep loaded at ring &lt; N+1). HLOD2/HLOD4 supertiles use exclusive shells
+    /// keyed off the nearest child tile ring in each block.
     /// </summary>
     public static class SpatialStreamingTileRingUtility
     {
@@ -103,34 +104,85 @@ namespace ZGConnect.SpatialStreaming
             if (blockSizeMeters <= 0)
                 return int.MaxValue;
 
-            int blockGridX = blockLeft / blockSizeMeters;
-            int blockGridZ = blockBottom / blockSizeMeters;
-            int camBlockGridX = SpatialTileIdUtility.AlignDownMeters(cameraTile.Left, blockSizeMeters) / blockSizeMeters;
-            int camBlockGridZ = SpatialTileIdUtility.AlignDownMeters(cameraTile.Bottom, blockSizeMeters) / blockSizeMeters;
+            SpatialTileIdUtility.ToGridIndices(blockLeft, blockBottom, blockSizeMeters, out int blockGridX, out int blockGridZ);
+            int camBlockLeft = SpatialTileIdUtility.AlignDownMeters(cameraTile.Left, blockSizeMeters);
+            int camBlockBottom = SpatialTileIdUtility.AlignDownMeters(cameraTile.Bottom, blockSizeMeters);
+            SpatialTileIdUtility.ToGridIndices(camBlockLeft, camBlockBottom, blockSizeMeters, out int camBlockGridX, out int camBlockGridZ);
             return Mathf.Max(Mathf.Abs(blockGridX - camBlockGridX), Mathf.Abs(blockGridZ - camBlockGridZ));
         }
 
-        public static int ChebyshevBlockRingForTile(
-            int tileLeft,
-            int tileBottom,
+        public static int MinTileRingInBlock(
+            int blockLeft,
+            int blockBottom,
             in CameraTileGrid cameraTile,
             int tileSizeMeters,
             int factor)
         {
-            int blockSize = tileSizeMeters * Mathf.Max(1, factor);
-            int blockLeft = SpatialTileIdUtility.AlignDownMeters(tileLeft, blockSize);
-            int blockBottom = SpatialTileIdUtility.AlignDownMeters(tileBottom, blockSize);
-            return ChebyshevBlockRing(blockLeft, blockBottom, cameraTile, blockSize);
+            if (tileSizeMeters <= 0)
+                tileSizeMeters = 1000;
+
+            int tilesPerSide = Mathf.Max(1, factor);
+            int minRing = int.MaxValue;
+            for (int dy = 0; dy < tilesPerSide; dy++)
+            {
+                for (int dx = 0; dx < tilesPerSide; dx++)
+                {
+                    int tileLeft = blockLeft + dx * tileSizeMeters;
+                    int tileBottom = blockBottom + dy * tileSizeMeters;
+                    int tileRing = ChebyshevTileRing(tileLeft, tileBottom, cameraTile, tileSizeMeters);
+                    if (tileRing < minRing)
+                        minRing = tileRing;
+                }
+            }
+
+            return minRing == int.MaxValue ? 0 : minRing;
+        }
+
+        static bool TileInExclusiveBand(int tileRing, int bandStart, int bandWidth, bool forWant)
+        {
+            if (bandWidth <= 0)
+                return false;
+
+            int limit = bandStart + bandWidth + (forWant ? 1 : 0);
+            return tileRing >= bandStart && tileRing < limit;
         }
 
         public static bool TileInDetailCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
             rings.detailRings > 0 && tileRing < rings.detailRings + (forWant ? 1 : 0);
 
-        public static bool TileInSubcellProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
-            rings.subcellProxyRings > 0 && tileRing < rings.SubcellProxyBandEnd + (forWant ? 1 : 0);
+        public static bool TileInExclusiveSubcellProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
+            TileInExclusiveBand(tileRing, rings.SubcellProxyBandStart, rings.subcellProxyRings, forWant);
 
-        public static bool TileInTileProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
-            rings.tileProxyRings > 0 && tileRing < rings.TileProxyBandEnd + (forWant ? 1 : 0);
+        public static bool TileInExclusiveTileProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
+            TileInExclusiveBand(tileRing, rings.TileProxyBandStart, rings.tileProxyRings, forWant);
+
+        public static bool TileInExclusiveHlod2Coverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
+            TileInExclusiveBand(tileRing, rings.Hlod2BandStart, rings.hlod2x2Rings, forWant);
+
+        public static bool TileInExclusiveHlod4Coverage(SpatialStreamingTileRings rings, int tileRing, bool forWant) =>
+            TileInExclusiveBand(tileRing, rings.Hlod4BandStart, rings.hlod4x4Rings, forWant);
+
+        /// <summary>
+        /// Cumulative 1 km coarse through sub-cell band, extended through the tile-proxy band so subcell tiles
+        /// stay covered until HLOD2 takes over (avoids a void at the tile-proxy shell).
+        /// </summary>
+        public static bool TileInSubcellProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant)
+        {
+            if (rings.subcellProxyRings <= 0 && rings.detailRings <= 0)
+                return false;
+
+            int end = rings.tileProxyRings > 0 ? rings.TileProxyBandEnd : rings.SubcellProxyBandEnd;
+            return tileRing < end + (forWant ? 1 : 0);
+        }
+
+        /// <summary>Cumulative 1 km tile-proxy band (includes detail + sub-cell coarse).</summary>
+        public static bool TileInTileProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant)
+        {
+            if (rings.tileProxyRings <= 0)
+                return false;
+
+            return tileRing < rings.TileProxyBandEnd + (forWant ? 1 : 0);
+        }
 
         public static bool ShouldWantDetail(SpatialStreamingTileRings rings, int tileRing) =>
             TileInDetailCoverage(rings, tileRing, forWant: true);
@@ -168,8 +220,17 @@ namespace ZGConnect.SpatialStreaming
             int factor) =>
             SupertileInCoverage(rings, blockLeft, blockBottom, cameraTile, tileSizeMeters, factor, forWant: false);
 
+        public static int MaxSupertileBlockScanRing(SpatialStreamingTileRings rings, int factor)
+        {
+            int maxTileRing = factor >= 4 ? rings.Hlod4BandEnd : rings.Hlod2BandEnd;
+            if (maxTileRing <= 0)
+                return 0;
+
+            return (maxTileRing + factor) / factor;
+        }
+
         /// <summary>
-        /// True when any 1 km child tile in the supertile block lies inside the cumulative HLOD band.
+        /// Supertile is in band when its nearest 1 km child tile lies in the exclusive HLOD shell for that factor.
         /// </summary>
         public static bool SupertileInCoverage(
             SpatialStreamingTileRings rings,
@@ -183,32 +244,20 @@ namespace ZGConnect.SpatialStreaming
             if (tileSizeMeters <= 0)
                 tileSizeMeters = 1000;
 
-            int bandEnd = factor >= 4 ? rings.Hlod4BandEnd : rings.Hlod2BandEnd;
-            if (bandEnd <= 0)
-                return false;
-
-            if (factor >= 4 && rings.hlod4x4Rings <= 0)
-                return false;
-
-            if (factor < 4 && rings.hlod2x2Rings <= 0)
-                return false;
-
-            int limit = bandEnd + (forWant ? 1 : 0);
-            int tilesPerSide = Mathf.Max(1, factor);
-
-            for (int dy = 0; dy < tilesPerSide; dy++)
+            if (factor >= 4)
             {
-                for (int dx = 0; dx < tilesPerSide; dx++)
-                {
-                    int tileLeft = blockLeft + dx * tileSizeMeters;
-                    int tileBottom = blockBottom + dy * tileSizeMeters;
-                    int tileRing = ChebyshevTileRing(tileLeft, tileBottom, cameraTile, tileSizeMeters);
-                    if (tileRing < limit)
-                        return true;
-                }
+                if (rings.hlod4x4Rings <= 0)
+                    return false;
+            }
+            else if (rings.hlod2x2Rings <= 0)
+            {
+                return false;
             }
 
-            return false;
+            int minTileRing = MinTileRingInBlock(blockLeft, blockBottom, cameraTile, tileSizeMeters, factor);
+            return factor >= 4
+                ? TileInExclusiveHlod4Coverage(rings, minTileRing, forWant)
+                : TileInExclusiveHlod2Coverage(rings, minTileRing, forWant);
         }
     }
 }

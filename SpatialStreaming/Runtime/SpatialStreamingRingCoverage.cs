@@ -182,6 +182,7 @@ namespace ZGConnect.SpatialStreaming
                 return false;
 
             int block2Size = tileSizeMeters * 2;
+            bool anyParticipatingChild = false;
             for (int dy = 0; dy < 2; dy++)
             {
                 for (int dx = 0; dx < 2; dx++)
@@ -200,12 +201,13 @@ namespace ZGConnect.SpatialStreaming
                         continue;
                     }
 
+                    anyParticipatingChild = true;
                     if (!Hlod2BlockReadyToReplaceHlod4(ctx, childLeft, childBottom, tileSizeMeters))
                         return false;
                 }
             }
 
-            return true;
+            return anyParticipatingChild;
         }
 
         public static bool Hlod2BlockFullyCoveredByOneKm(
@@ -247,8 +249,14 @@ namespace ZGConnect.SpatialStreaming
             if (Hlod2BlockFullyCoveredByOneKm(ctx, block2Left, block2Bottom, tileSizeMeters))
                 return true;
 
-            return TryGetLoadedSupertileAt(
-                ctx, block2Left, block2Bottom, SpatialStreamingLodLevel.Hlod2x2, tileSizeMeters, out _);
+            if (!TryGetLoadedSupertileAt(
+                    ctx, block2Left, block2Bottom, SpatialStreamingLodLevel.Hlod2x2, tileSizeMeters, out SpatialLoadedSubcellRecord hlod2) ||
+                hlod2 == null)
+            {
+                return false;
+            }
+
+            return ShouldRenderHlod2(ctx, hlod2);
         }
 
         public static bool IsHlod2BlockReadyToReplaceHlod4(

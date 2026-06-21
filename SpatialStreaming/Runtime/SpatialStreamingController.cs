@@ -27,9 +27,9 @@ namespace ZGConnect.SpatialStreaming
         [SerializeField] int _subcellProxyRings = 2;
         [Tooltip("Exclusive tile rings outside sub-cell proxy band — full tile proxies. 0 = skip.")]
         [SerializeField] int _tileProxyRings = 2;
-        [Tooltip("Cumulative 1 km tile rings through HLOD2 (after tile-proxy band). 0 = skip.")]
+        [Tooltip("Exclusive 1 km tile rings outside the tile-proxy band for HLOD2 (2×2 km blocks). 0 = skip.")]
         [SerializeField] int _hlod2x2Rings = 3;
-        [Tooltip("Cumulative 1 km tile rings through HLOD4 (after HLOD2 band). 0 = skip.")]
+        [Tooltip("Exclusive 1 km tile rings outside the HLOD2 band for HLOD4 (4×4 km blocks). 0 = skip.")]
         [SerializeField] int _hlod4x4Rings = 5;
 
         [Header("Streaming")]

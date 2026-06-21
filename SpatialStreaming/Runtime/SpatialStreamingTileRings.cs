@@ -9,16 +9,16 @@ namespace ZGConnect.SpatialStreaming
         [Tooltip("Square of 1 km tiles with full detail. 1 = camera tile only, 2 = 3×3 (9 tiles). 0 = skip.")]
         public int detailRings;
 
-        [Tooltip("Cumulative tile rings through detail + sub-cell proxies. 0 = skip sub-cell proxy layer.")]
+        [Tooltip("Exclusive 1 km tile rings outside the detail band for sub-cell proxies. 0 = skip.")]
         public int subcellProxyRings;
 
-        [Tooltip("Cumulative tile rings through tile proxies (includes detail + sub-cell bands). 0 = skip.")]
+        [Tooltip("Exclusive 1 km tile rings outside the sub-cell band for full tile proxies. 0 = skip.")]
         public int tileProxyRings;
 
-        [Tooltip("Cumulative 1 km tile rings through HLOD2 (after tile-proxy band). 0 = skip.")]
+        [Tooltip("Exclusive 1 km tile rings outside the tile-proxy band for HLOD2 (2×2 km blocks). 0 = skip.")]
         public int hlod2x2Rings;
 
-        [Tooltip("Cumulative 1 km tile rings through HLOD4 (after HLOD2 band). 0 = skip.")]
+        [Tooltip("Exclusive 1 km tile rings outside the HLOD2 band for HLOD4 (4×4 km blocks). 0 = skip.")]
         public int hlod4x4Rings;
 
         public static SpatialStreamingTileRings Default => new()
@@ -42,11 +42,15 @@ namespace ZGConnect.SpatialStreaming
         public int TileProxyBandEnd =>
             TileProxyBandStart + (tileProxyRings > 0 ? tileProxyRings : 0);
 
+        public int Hlod2BandStart => TileProxyBandEnd;
+
         public int Hlod2BandEnd =>
-            TileProxyBandEnd + (hlod2x2Rings > 0 ? hlod2x2Rings : 0);
+            Hlod2BandStart + (hlod2x2Rings > 0 ? hlod2x2Rings : 0);
+
+        public int Hlod4BandStart => Hlod2BandEnd;
 
         public int Hlod4BandEnd =>
-            Hlod2BandEnd + (hlod4x4Rings > 0 ? hlod4x4Rings : 0);
+            Hlod4BandStart + (hlod4x4Rings > 0 ? hlod4x4Rings : 0);
 
         /// <summary>True when any coarse layer (proxy / HLOD) is configured. 0 = detail-only streaming.</summary>
         public bool UsesCoarseLodChain =>
