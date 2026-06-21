@@ -260,6 +260,20 @@ namespace ZGConnect
                 return true;
             }
 
+            if (n.EndsWith("_roof", System.StringComparison.Ordinal) ||
+                (n.Contains("footprintproxy") && n.Contains("roof")))
+            {
+                surfaceType = BuildingSurfaceMaterialType.RoofFlat;
+                return true;
+            }
+
+            if (n.EndsWith("_facade", System.StringComparison.Ordinal) ||
+                (n.Contains("footprintproxy") && n.Contains("facade")))
+            {
+                surfaceType = BuildingSurfaceMaterialType.Facade;
+                return true;
+            }
+
             return false;
         }
 

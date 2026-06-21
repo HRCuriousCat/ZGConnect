@@ -24,8 +24,8 @@ namespace ZGConnect.SpatialStreaming
         public bool logRendererCounts;
 
         [Tooltip(
-            "Skip GPU-driven opt-in when a spawned root has more renderers than this. " +
-            "Prevents thousands of BRG indirect draws when mesh combine did not run.")]
+            "Max mesh renderers per spawned root that opt into GPU-driven drawing. " +
+            "0 = no limit. When set, the first N renderers in hierarchy order are opted in.")]
         public int maxRenderersForGpuOptIn = 32;
     }
 }

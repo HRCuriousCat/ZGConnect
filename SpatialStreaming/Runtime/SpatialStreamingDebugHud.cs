@@ -22,17 +22,34 @@ namespace ZGConnect.SpatialStreaming
         [SerializeField] bool _visible = true;
         [SerializeField] KeyCode _toggleKey = KeyCode.F3;
         [SerializeField] Vector2 _margin = new(12f, 12f);
-        [SerializeField] float _width = 380f;
+        [SerializeField] float _width = 430f;
+        [SerializeField] float _scale = 1f;
 
         Canvas _canvas;
+        RectTransform _panelRt;
         Text _statsText;
+        float _appliedScale = float.NaN;
 
         public void Initialize(SpatialStreamingController controller)
         {
             _controller = controller;
             if (_canvas == null)
                 BuildUi();
+            ApplySettings(_scale);
             SetVisible(_visible);
+        }
+
+        public void ApplySettings(float scale)
+        {
+            _scale = Mathf.Max(0.25f, scale);
+            if (_panelRt == null)
+                return;
+
+            if (Mathf.Approximately(_appliedScale, _scale))
+                return;
+
+            _appliedScale = _scale;
+            _panelRt.localScale = Vector3.one * _scale;
         }
 
         public void SetVisible(bool visible)
@@ -129,17 +146,17 @@ namespace ZGConnect.SpatialStreaming
             scaler.matchWidthOrHeight = 0.5f;
 
             Sprite uiSprite = GetUiSprite();
-            Font font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
-            if (font == null)
-                font = Font.CreateDynamicFontFromOSFont(new[] { "Segoe UI", "Arial" }, 14);
+            Font font = ResolveMonospaceFont();
 
             var panel = CreatePanel(canvasGo.transform, "Panel", new Color(0.04f, 0.16f, 0.2f, 0.88f), uiSprite);
-            var panelRt = panel.GetComponent<RectTransform>();
-            panelRt.anchorMin = new Vector2(0f, 1f);
-            panelRt.anchorMax = new Vector2(0f, 1f);
-            panelRt.pivot = new Vector2(0f, 1f);
-            panelRt.anchoredPosition = new Vector2(_margin.x, -_margin.y);
-            panelRt.sizeDelta = new Vector2(_width, 520f);
+            _panelRt = panel.GetComponent<RectTransform>();
+            _panelRt.anchorMin = new Vector2(0f, 1f);
+            _panelRt.anchorMax = new Vector2(0f, 1f);
+            _panelRt.pivot = new Vector2(0f, 1f);
+            _panelRt.anchoredPosition = new Vector2(_margin.x, -_margin.y);
+            _panelRt.sizeDelta = new Vector2(_width, 560f);
+            _panelRt.localScale = Vector3.one * _scale;
+            _appliedScale = _scale;
 
             var layout = panel.AddComponent<VerticalLayoutGroup>();
             layout.padding = new RectOffset(12, 12, 10, 10);
@@ -172,9 +189,24 @@ namespace ZGConnect.SpatialStreaming
 #endif
         }
 
+        static Font ResolveMonospaceFont()
+        {
+            Font font = Font.CreateDynamicFontFromOSFont(
+                new[] { "Consolas", "Cascadia Mono", "Courier New", "Lucida Console", "Menlo" },
+                13);
+            if (font != null)
+                return font;
+
+            font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+            if (font != null)
+                return font;
+
+            return Font.CreateDynamicFontFromOSFont(new[] { "Segoe UI", "Arial" }, 13);
+        }
+
         static Text CreateStatsText(Transform parent, Font font)
         {
-            var go = CreateText(parent, "Stats", string.Empty, 12, FontStyle.Normal, font);
+            var go = CreateText(parent, "Stats", string.Empty, 13, FontStyle.Normal, font);
             var text = go.GetComponent<Text>();
             text.color = new Color(0.92f, 0.95f, 0.98f, 1f);
             text.supportRichText = false;
@@ -183,7 +215,7 @@ namespace ZGConnect.SpatialStreaming
             text.alignment = TextAnchor.UpperLeft;
 
             var layout = go.AddComponent<LayoutElement>();
-            layout.minHeight = 420f;
+            layout.minHeight = 460f;
             layout.flexibleHeight = 1f;
             return text;
         }

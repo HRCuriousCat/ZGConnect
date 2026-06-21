@@ -8,7 +8,8 @@ namespace ZGConnect.SpatialStreaming
     /// The bundle loads this descriptor plus referenced mesh/material assets, then runtime creates
     /// a minimal renderer hierarchy instead of deserializing and instantiating a prefab graph.
     /// </summary>
-    public sealed class SpatialMeshDetailAsset : ScriptableObject
+    [CreateAssetMenu(fileName = "SpatialMeshDetailAsset", menuName = "ZG Connect/Spatial Mesh Detail Asset")]
+    public class SpatialMeshDetailAsset : ScriptableObject
     {
         public string TileId;
         public string SubcellId;

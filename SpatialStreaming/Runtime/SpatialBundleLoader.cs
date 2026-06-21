@@ -3,7 +3,6 @@ using System.IO;
 using System.Threading.Tasks;
 using GLTFast;
 using UnityEngine;
-using UnityEngine.Profiling;
 
 namespace ZGConnect.SpatialStreaming
 {
@@ -42,12 +41,10 @@ namespace ZGConnect.SpatialStreaming
 
             AssetBundle bundle = null;
             string loadError = null;
-            Profiler.BeginSample("SpatialStreaming.LoadAssetBundle");
             yield return SpatialAssetBundleCache.AcquireAsync(
                 bundleFullPath,
                 acquired => bundle = acquired,
                 error => loadError = error);
-            Profiler.EndSample();
 
             if (bundle == null)
             {
@@ -56,34 +53,39 @@ namespace ZGConnect.SpatialStreaming
             }
 
             string[] assetNames = bundle.GetAllAssetNames();
-            if (preferMeshDetail)
+            if (preferMeshDetail && SpatialMeshDetailRuntime.IsAvailable)
             {
                 string detailAssetName = FindMeshDetailAssetName(assetNames);
-                if (string.IsNullOrEmpty(detailAssetName))
+                if (!string.IsNullOrEmpty(detailAssetName))
                 {
-                    SpatialAssetBundleCache.Release(bundleFullPath, unloadAllLoadedObjects: true);
-                    into.Error = $"Mesh detail descriptor not found in spatial bundle: {bundleFullPath}";
-                    yield break;
+                    AssetBundleRequest detailRequest = bundle.LoadAssetAsync<SpatialMeshDetailAsset>(detailAssetName);
+                    yield return detailRequest;
+
+                    if (detailRequest.asset is SpatialMeshDetailAsset detail)
+                    {
+                        into.Success = true;
+                        into.MeshDetail = detail;
+                        into.Bundle = bundle;
+                        into.BundleFullPath = bundleFullPath;
+                        yield break;
+                    }
+
+                    SpatialMeshDetailRuntime.MarkUnavailable();
                 }
+            }
 
-                AssetBundleRequest detailRequest = bundle.LoadAssetAsync<SpatialMeshDetailAsset>(detailAssetName);
-                Profiler.BeginSample("SpatialStreaming.LoadMeshDetailAssetAsync");
-                yield return detailRequest;
-                Profiler.EndSample();
+            if (TryLoadPrefabFromBundle(bundle, assetNames, bundleFullPath, into))
+                yield break;
 
-                SpatialMeshDetailAsset detail = detailRequest.asset as SpatialMeshDetailAsset;
-                if (detail == null)
+            if (preferMeshDetail && SpatialMeshDetailRuntime.IsAvailable)
+            {
+                string detailAssetName = FindMeshDetailAssetName(assetNames);
+                if (!string.IsNullOrEmpty(detailAssetName))
                 {
                     SpatialAssetBundleCache.Release(bundleFullPath, unloadAllLoadedObjects: true);
                     into.Error = $"Failed to load mesh detail descriptor '{detailAssetName}' from spatial bundle.";
                     yield break;
                 }
-
-                into.Success = true;
-                into.MeshDetail = detail;
-                into.Bundle = bundle;
-                into.BundleFullPath = bundleFullPath;
-                yield break;
             }
 
             string prefabAssetName = FindPrefabAssetName(assetNames);
@@ -95,9 +97,7 @@ namespace ZGConnect.SpatialStreaming
             }
 
             AssetBundleRequest assetRequest = bundle.LoadAssetAsync<GameObject>(prefabAssetName);
-            Profiler.BeginSample("SpatialStreaming.LoadAssetAsync");
             yield return assetRequest;
-            Profiler.EndSample();
 
             GameObject prefab = assetRequest.asset as GameObject;
             if (prefab == null)
@@ -115,6 +115,39 @@ namespace ZGConnect.SpatialStreaming
 
         public static void Release(string bundleFullPath, bool unloadAllLoadedObjects = false) =>
             SpatialAssetBundleCache.Release(bundleFullPath, unloadAllLoadedObjects);
+
+        /// <summary>
+        /// Unloads the bundle archive after spawn while keeping loaded meshes/materials alive on instances.
+        /// Allows the next overlapping spatial bundle to load without "same files already loaded" errors.
+        /// </summary>
+        public static void ReleaseArchiveAfterSpawn(string bundleFullPath)
+        {
+            if (string.IsNullOrEmpty(bundleFullPath))
+                return;
+
+            SpatialAssetBundleCache.Release(bundleFullPath, unloadAllLoadedObjects: false);
+        }
+
+        static bool TryLoadPrefabFromBundle(
+            AssetBundle bundle,
+            string[] assetNames,
+            string bundleFullPath,
+            LoadResult into)
+        {
+            string prefabAssetName = FindPrefabAssetName(assetNames);
+            if (string.IsNullOrEmpty(prefabAssetName))
+                return false;
+
+            GameObject prefab = bundle.LoadAsset<GameObject>(prefabAssetName);
+            if (prefab == null)
+                return false;
+
+            into.Success = true;
+            into.Prefab = prefab;
+            into.Bundle = bundle;
+            into.BundleFullPath = bundleFullPath;
+            return true;
+        }
 
         static string FindPrefabAssetName(string[] assetNames)
         {

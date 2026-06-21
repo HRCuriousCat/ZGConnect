@@ -47,13 +47,13 @@ namespace ZGConnect.SpatialStreaming
         [Tooltip("Merge tile proxies into 2×2 and 4×4 supertile bundles.")]
         public bool bakeHlodSupertiles = true;
 
-        [Tooltip("Fallback when BuildingSurfaceSettings is not assigned. Ignored when settings are set.")]
+        [Tooltip("Optional textureless placeholder for prefab save (built-in Default-Material when unset). Do not assign facade atlases.")]
         public Material proxyMaterialOverride;
 
         [Header("Asset bundles")]
         public bool uncompressedBundles;
 
-        [Tooltip("Detail subcell bundle payload. MeshAssets skips prefab deserialization at runtime.")]
+        [Tooltip("Detail subcell bundle payload. MeshAssets bakes a SpatialMeshDetailAsset only (no prefab duplicate).")]
         public SpatialDetailBundleMode detailBundleMode = SpatialDetailBundleMode.MeshAssets;
 
         [Header("Bake scope")]

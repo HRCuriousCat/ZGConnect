@@ -106,7 +106,7 @@ namespace ZGConnect.SpatialStreaming
             }
 
             bool streamingActive = streamingStats.Pending > 0 ||
-                                   streamingStats.Loading > 0 ||
+                                   _loadStartsThisFrame > 0 ||
                                    _spawnMsThisFrame > 0.01f;
 
             if (_lastFrameMs < spikeFrameMsThreshold || !streamingActive)
@@ -119,7 +119,7 @@ namespace ZGConnect.SpatialStreaming
                 Debug.LogWarning(
                     $"[ZGConnect.Spatial] Frame spike {_lastFrameMs:F1} ms " +
                     $"(fps≈{_smoothedFps:F0}) pending={streamingStats.Pending} loading={streamingStats.Loading} " +
-                    $"spawnMs={_spawnMsThisFrame:F1} last='{_lastSpawnKey}'");
+                    $"spawnMs={_spawnMsThisFrame:F1} mainThreadMs last='{_lastSpawnKey}'");
             }
 
             if (!logSpikesToCsv)

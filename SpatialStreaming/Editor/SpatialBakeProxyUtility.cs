@@ -9,17 +9,14 @@ namespace ZGConnect.SpatialStreaming.Editor
 {
     public static class SpatialBakeProxyUtility
     {
-        public static Material ResolveProxyMaterial(SpatialBakeProfile profile)
+        /// <summary>
+        /// Textureless placeholder for prefab save only — not remapped at runtime.
+        /// Proxy bundles store mesh + <see cref="SpatialFootprintProxySurfaceHint"/> slots.
+        /// </summary>
+        public static Material ResolveBakePlaceholderMaterial(SpatialBakeProfile profile)
         {
             if (profile?.proxyMaterialOverride != null)
                 return profile.proxyMaterialOverride;
-
-            if (profile?.buildingSurfaceSettings != null)
-            {
-                Material facade = profile.buildingSurfaceSettings.GetFacadeMaterial(BuildingCategory.House, 0);
-                if (facade != null)
-                    return facade;
-            }
 
             return AssetDatabase.GetBuiltinExtraResource<Material>("Default-Material.mat");
         }
@@ -49,8 +46,6 @@ namespace ZGConnect.SpatialStreaming.Editor
             if (!TryBuildProxyCombinedRoot(
                     profile,
                     tileId,
-                    tileUnityPosition,
-                    tileSizeMeters,
                     tileRoot,
                     buildings,
                     out GameObject combinedRoot,
@@ -65,7 +60,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             prefabAssetPath = $"{stagingFolder}/Spatial_{tileId}_tile_proxy.prefab";
             bundleName = $"{tileId}/tile_proxy";
 
-            return SaveDetachedPrefab(combinedRoot, prefabAssetPath, ownedMeshes, out error);
+            return SaveDetachedPrefab(combinedRoot, prefabAssetPath, ownedMeshes, profile, out error);
         }
 
         public static bool TryBakeSubcellProxy(
@@ -98,8 +93,6 @@ namespace ZGConnect.SpatialStreaming.Editor
             if (!TryBuildProxyCombinedRoot(
                     profile,
                     tileId,
-                    tileUnityPosition,
-                    tileSizeMeters,
                     subcellRoot,
                     buildings,
                     out GameObject combinedRoot,
@@ -114,14 +107,12 @@ namespace ZGConnect.SpatialStreaming.Editor
             prefabAssetPath = $"{stagingFolder}/Spatial_{tileId}_{subcellId}_proxy.prefab";
             bundleName = $"{tileId}/{subcellId}_proxy";
 
-            return SaveDetachedPrefab(combinedRoot, prefabAssetPath, ownedMeshes, out error);
+            return SaveDetachedPrefab(combinedRoot, prefabAssetPath, ownedMeshes, profile, out error);
         }
 
         static bool TryBuildProxyCombinedRoot(
             SpatialBakeProfile profile,
             string tileId,
-            Vector3 tileUnityPosition,
-            int tileSizeMeters,
             Transform bakeRoot,
             List<Transform> buildings,
             out GameObject combinedRoot,
@@ -132,10 +123,10 @@ namespace ZGConnect.SpatialStreaming.Editor
             ownedMeshes = new List<Mesh>();
             error = null;
 
-            Material proxyMaterial = ResolveProxyMaterial(profile);
-            if (proxyMaterial == null)
+            Material placeholder = ResolveBakePlaceholderMaterial(profile);
+            if (placeholder == null)
             {
-                error = "no proxy material";
+                error = "no bake placeholder material";
                 return false;
             }
 
@@ -145,12 +136,12 @@ namespace ZGConnect.SpatialStreaming.Editor
                     buildings,
                     tileId,
                     profile.buildingSurfaceSettings,
-                    proxyMaterial,
+                    placeholder,
                     ownedMeshes)
                 : SpatialFootprintBoxUtility.BuildCombinedFootprintRoot(
                     bakeRoot,
                     buildings,
-                    proxyMaterial,
+                    placeholder,
                     ownedMeshes);
 
             if (combinedRoot == null || combinedRoot.transform.childCount == 0)
@@ -160,23 +151,39 @@ namespace ZGConnect.SpatialStreaming.Editor
                 return false;
             }
 
-            if (profile.buildingSurfaceSettings != null)
-            {
-                SpatialBuildingMaterialApplier.ApplyFacadeMaterialsToCombinedInstance(
-                    combinedRoot,
-                    tileId,
-                    tileUnityPosition,
-                    tileSizeMeters,
-                    profile.buildingSurfaceSettings);
-            }
-
             return true;
+        }
+
+        public static void AssignBakePlaceholderMaterials(GameObject root, Material placeholder)
+        {
+            if (root == null || placeholder == null)
+                return;
+
+            foreach (MeshRenderer renderer in root.GetComponentsInChildren<MeshRenderer>(true))
+            {
+                if (renderer == null)
+                    continue;
+
+                Material[] slots = renderer.sharedMaterials;
+                if (slots == null || slots.Length == 0)
+                {
+                    renderer.sharedMaterial = placeholder;
+                    continue;
+                }
+
+                var mapped = new Material[slots.Length];
+                for (int i = 0; i < slots.Length; i++)
+                    mapped[i] = placeholder;
+
+                renderer.sharedMaterials = mapped;
+            }
         }
 
         public static bool SaveDetachedPrefab(
             GameObject combinedRoot,
             string prefabAssetPath,
             List<Mesh> ownedMeshes,
+            SpatialBakeProfile profile,
             out string error)
         {
             error = null;
@@ -194,6 +201,7 @@ namespace ZGConnect.SpatialStreaming.Editor
 
             try
             {
+                AssignBakePlaceholderMaterials(combinedRoot, ResolveBakePlaceholderMaterial(profile));
                 SpatialBakePipeline.PrepareHierarchyForPrefabSavePublic(combinedRoot);
                 foreach (Mesh mesh in ownedMeshes)
                 {
@@ -213,6 +221,7 @@ namespace ZGConnect.SpatialStreaming.Editor
                 if (embeddedMeshes > 0)
                 {
                     AssetDatabase.SaveAssets();
+                    AssignBakePlaceholderMaterials(combinedRoot, ResolveBakePlaceholderMaterial(profile));
                     PrefabUtility.SaveAsPrefabAsset(combinedRoot, prefabAssetPath);
                 }
             }

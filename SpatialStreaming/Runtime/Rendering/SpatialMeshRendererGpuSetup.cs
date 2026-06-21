@@ -34,13 +34,18 @@ namespace ZGConnect.SpatialStreaming
             {
                 var meshRenderers = root.GetComponentsInChildren<MeshRenderer>(true);
                 result.MeshRendererCount = meshRenderers.Length;
-                bool allowGpuOptIn = maxRenderersForGpuOptIn <= 0 ||
-                                     meshRenderers.Length <= maxRenderersForGpuOptIn;
+                int gpuOptInBudget = maxRenderersForGpuOptIn <= 0
+                    ? int.MaxValue
+                    : maxRenderersForGpuOptIn;
 
                 foreach (MeshRenderer renderer in meshRenderers)
                 {
+                    bool allowGpuOptIn = gpuOptInBudget > 0;
                     if (TryPrepareRenderer(renderer, allowGpuOptIn))
                         result.EnabledCount++;
+
+                    if (allowGpuOptIn && IsGpuDrivenOptedIn(renderer))
+                        gpuOptInBudget--;
                 }
 
                 result.SkinnedMeshRendererCount = root.GetComponentsInChildren<SkinnedMeshRenderer>(true).Length;

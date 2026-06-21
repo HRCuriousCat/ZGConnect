@@ -1,3 +1,5 @@
+using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
@@ -18,6 +20,46 @@ namespace ZGConnect.SpatialStreaming.Editor
 
     public static class SpatialSupertileBakeUtility
     {
+        public static IEnumerator BakeSupertilesCoroutine(
+            SpatialBakeProfile profile,
+            int tileSizeMeters,
+            List<SpatialBakedTileProxyInfo> tileProxies,
+            SpatialDatasetManifest manifest,
+            List<AssetBundleBuild> bundleBuilds,
+            string stagingRoot,
+            Action<float, string> onProgress = null)
+        {
+            if (profile == null || !profile.bakeHlodSupertiles || tileProxies == null || tileProxies.Count == 0)
+                yield break;
+
+            manifest.Supertiles ??= new List<SpatialSupertileManifestEntry>();
+            manifest.Supertiles.Clear();
+
+            IEnumerator bake2 = BakeFactorCoroutine(
+                profile,
+                tileSizeMeters,
+                tileProxies,
+                manifest,
+                bundleBuilds,
+                stagingRoot,
+                factor: 2,
+                onProgress);
+            while (bake2.MoveNext())
+                yield return bake2.Current;
+
+            IEnumerator bake4 = BakeFactorCoroutine(
+                profile,
+                tileSizeMeters,
+                tileProxies,
+                manifest,
+                bundleBuilds,
+                stagingRoot,
+                factor: 4,
+                onProgress);
+            while (bake4.MoveNext())
+                yield return bake4.Current;
+        }
+
         public static void BakeSupertiles(
             SpatialBakeProfile profile,
             int tileSizeMeters,
@@ -49,6 +91,74 @@ namespace ZGConnect.SpatialStreaming.Editor
                 bundleBuilds,
                 stagingRoot,
                 factor: 4);
+        }
+
+        static IEnumerator BakeFactorCoroutine(
+            SpatialBakeProfile profile,
+            int tileSizeMeters,
+            List<SpatialBakedTileProxyInfo> tileProxies,
+            SpatialDatasetManifest manifest,
+            List<AssetBundleBuild> bundleBuilds,
+            string stagingRoot,
+            int factor,
+            Action<float, string> onProgress)
+        {
+            int blockSizeMeters = tileSizeMeters * factor;
+            var groups = new Dictionary<string, List<SpatialBakedTileProxyInfo>>();
+
+            foreach (SpatialBakedTileProxyInfo tile in tileProxies)
+            {
+                if (tile == null || string.IsNullOrEmpty(tile.PrefabAssetPath))
+                    continue;
+
+                int blockLeft = SpatialTileIdUtility.AlignDownMeters(tile.Left, blockSizeMeters);
+                int blockBottom = SpatialTileIdUtility.AlignDownMeters(tile.Bottom, blockSizeMeters);
+                string key = SpatialStreamingPaths.GetSupertileId(factor, blockLeft, blockBottom);
+                if (!groups.TryGetValue(key, out List<SpatialBakedTileProxyInfo> list))
+                {
+                    list = new List<SpatialBakedTileProxyInfo>();
+                    groups[key] = list;
+                }
+
+                list.Add(tile);
+            }
+
+            int total = groups.Count;
+            int done = 0;
+            foreach (KeyValuePair<string, List<SpatialBakedTileProxyInfo>> kvp in groups)
+            {
+                if (kvp.Value.Count == 0)
+                    continue;
+
+                onProgress?.Invoke(
+                    total > 0 ? (float)done / total : 0f,
+                    $"HLOD{factor} {kvp.Key}");
+
+                if (!TryBakeSupertilePrefab(
+                        profile,
+                        factor,
+                        tileSizeMeters,
+                        kvp.Value,
+                        stagingRoot,
+                        out SpatialSupertileManifestEntry entry,
+                        out string prefabAssetPath,
+                        out string bundleName))
+                {
+                    done++;
+                    yield return null;
+                    continue;
+                }
+
+                manifest.Supertiles.Add(entry);
+                bundleBuilds.Add(new AssetBundleBuild
+                {
+                    assetBundleName = bundleName,
+                    assetNames = new[] { prefabAssetPath },
+                });
+
+                done++;
+                yield return null;
+            }
         }
 
         static void BakeFactor(
@@ -121,8 +231,8 @@ namespace ZGConnect.SpatialStreaming.Editor
             prefabAssetPath = null;
             bundleName = null;
 
-            Material proxyMaterial = SpatialBakeProxyUtility.ResolveProxyMaterial(profile);
-            if (proxyMaterial == null)
+            Material placeholder = SpatialBakeProxyUtility.ResolveBakePlaceholderMaterial(profile);
+            if (placeholder == null)
                 return false;
 
             int alignedBlockSize = tileSizeMeters * factor;
@@ -130,7 +240,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             int blockBottom = SpatialTileIdUtility.AlignDownMeters(tiles[0].Bottom, alignedBlockSize);
             Vector3 origin = new Vector3(float.MaxValue, 0f, float.MaxValue);
             var childTileIds = new List<string>();
-            var groups = new Dictionary<string, SupertileMaterialGroup>(System.StringComparer.Ordinal);
+            var groups = new Dictionary<string, SupertileSurfaceGroup>(System.StringComparer.Ordinal);
 
             foreach (SpatialBakedTileProxyInfo tile in tiles)
             {
@@ -153,17 +263,23 @@ namespace ZGConnect.SpatialStreaming.Editor
                     if (filter == null || filter.sharedMesh == null)
                         continue;
 
-                    Material material = meshRenderer.sharedMaterial;
-                    if (material == null)
-                        continue;
-
-                    string groupKey = BuildingSurfaceUtility.NormalizeMaterialName(material.name);
-                    if (string.IsNullOrEmpty(groupKey))
-                        groupKey = material.name;
-
-                    if (!groups.TryGetValue(groupKey, out SupertileMaterialGroup group))
+                    if (!SpatialFootprintBoxUtility.TryResolveProxySurfaceHint(
+                            meshRenderer,
+                            out BuildingCategory category,
+                            out BuildingSurfaceMaterialType surfaceType))
                     {
-                        group = new SupertileMaterialGroup { Material = material };
+                        continue;
+                    }
+
+                    string groupKey = BuildingSurfaceUtility.CategoryToSlotToken(category) + "_" +
+                                        BuildingSurfaceUtility.SurfaceToSlotToken(surfaceType);
+                    if (!groups.TryGetValue(groupKey, out SupertileSurfaceGroup group))
+                    {
+                        group = new SupertileSurfaceGroup
+                        {
+                            Category = category,
+                            SurfaceType = surfaceType,
+                        };
                         groups[groupKey] = group;
                     }
 
@@ -181,34 +297,43 @@ namespace ZGConnect.SpatialStreaming.Editor
 
             var root = new GameObject(SpatialMeshCombineUtility.CombinedRenderRootName);
             var ownedMeshes = new List<Mesh>();
-            int groupIndex = 0;
             int totalInstances = 0;
 
-            foreach (KeyValuePair<string, SupertileMaterialGroup> kvp in groups)
+            foreach (KeyValuePair<string, SupertileSurfaceGroup> kvp in groups)
             {
-                SupertileMaterialGroup group = kvp.Value;
+                SupertileSurfaceGroup group = kvp.Value;
                 if (group.Instances.Count == 0)
                     continue;
 
                 totalInstances += group.Instances.Count;
+                string meshName = SpatialFootprintBoxUtility.BuildFootprintProxyMeshName(
+                    group.Category,
+                    group.SurfaceType);
                 Mesh combined = SpatialMeshCombineUtility.CombineMeshesInSpace(
                     group.Instances,
                     mergeSubMeshes: true,
-                    $"Hlod{factor}_Combined_{groupIndex++}",
+                    meshName,
                     ownedMeshes);
 
                 if (combined == null)
                     continue;
 
-                var child = new GameObject($"Combined_{kvp.Key}");
+                string objectName = SpatialFootprintBoxUtility.BuildCombinedProxyObjectName(
+                    group.Category,
+                    group.SurfaceType);
+                var child = new GameObject(objectName);
                 child.transform.SetParent(root.transform, false);
                 child.AddComponent<MeshFilter>().sharedMesh = combined;
-                child.AddComponent<MeshRenderer>().sharedMaterial = group.Material;
+                var renderer = child.AddComponent<MeshRenderer>();
+                renderer.sharedMaterial = placeholder;
+                var hint = child.AddComponent<SpatialFootprintProxySurfaceHint>();
+                hint.category = group.Category;
+                hint.surfaceType = group.SurfaceType;
             }
 
             if (root.transform.childCount == 0)
             {
-                Object.DestroyImmediate(root);
+                UnityEngine.Object.DestroyImmediate(root);
                 return false;
             }
 
@@ -217,15 +342,15 @@ namespace ZGConnect.SpatialStreaming.Editor
             ZGConnectPathUtils.EnsureAssetFolder(folder);
             prefabAssetPath = $"{folder}/Spatial_{supertileId}.prefab";
 
-            if (!SpatialBakeProxyUtility.SaveDetachedPrefab(root, prefabAssetPath, ownedMeshes, out string error))
+            if (!SpatialBakeProxyUtility.SaveDetachedPrefab(root, prefabAssetPath, ownedMeshes, profile, out string error))
             {
-                Object.DestroyImmediate(root);
+                UnityEngine.Object.DestroyImmediate(root);
                 if (profile.verboseBakeLogging)
                     SpatialBakeVerboseLog.Global("hlod-save-failed", $"{supertileId}: {error}");
                 return false;
             }
 
-            Object.DestroyImmediate(root);
+            UnityEngine.Object.DestroyImmediate(root);
 
             entry = new SpatialSupertileManifestEntry
             {
@@ -249,9 +374,10 @@ namespace ZGConnect.SpatialStreaming.Editor
             return true;
         }
 
-        sealed class SupertileMaterialGroup
+        sealed class SupertileSurfaceGroup
         {
-            public Material Material;
+            public BuildingCategory Category;
+            public BuildingSurfaceMaterialType SurfaceType;
             public readonly List<CombineInstance> Instances = new();
         }
     }

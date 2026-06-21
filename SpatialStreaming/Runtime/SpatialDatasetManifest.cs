@@ -55,13 +55,26 @@ namespace ZGConnect.SpatialStreaming
             if (string.IsNullOrEmpty(tileId) || Tiles == null)
                 return null;
 
+            EnsureTileIndex();
+            return _tileIndex.TryGetValue(tileId, out SpatialTileManifestEntry tile) ? tile : null;
+        }
+
+        [NonSerialized] Dictionary<string, SpatialTileManifestEntry> _tileIndex;
+
+        void EnsureTileIndex()
+        {
+            if (_tileIndex != null)
+                return;
+
+            _tileIndex = new Dictionary<string, SpatialTileManifestEntry>(Tiles?.Count ?? 0);
+            if (Tiles == null)
+                return;
+
             foreach (SpatialTileManifestEntry tile in Tiles)
             {
-                if (tile != null && tile.TileId == tileId)
-                    return tile;
+                if (tile != null && !string.IsNullOrEmpty(tile.TileId))
+                    _tileIndex[tile.TileId] = tile;
             }
-
-            return null;
         }
     }
 

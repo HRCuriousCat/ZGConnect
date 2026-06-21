@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Rendering;
 using ZGConnect;
 
 namespace ZGConnect.SpatialStreaming
@@ -14,7 +16,7 @@ namespace ZGConnect.SpatialStreaming
         const float FloorBandHeightRatio = 0.12f;
         const float FloorBandMinMeters = 0.35f;
 
-        static Mesh _unitBoxMesh;
+        static Mesh _facadeRoofUnitBoxMesh;
 
         public static GameObject BuildCombinedFootprintRoot(
             Transform bakeRoot,
@@ -38,6 +40,13 @@ namespace ZGConnect.SpatialStreaming
                 bakeRoot, buildings, tileId, settings, fallbackMaterial, ownedMeshes);
         }
 
+        sealed class FootprintCategoryGroup
+        {
+            public BuildingCategory Category;
+            public readonly List<CombineInstance> FacadeInstances = new();
+            public readonly List<CombineInstance> RoofInstances = new();
+        }
+
         static GameObject BuildCombinedFootprintRootInternal(
             Transform bakeRoot,
             IReadOnlyList<Transform> buildings,
@@ -49,41 +58,46 @@ namespace ZGConnect.SpatialStreaming
             if (bakeRoot == null || buildings == null || buildings.Count == 0)
                 return null;
 
-            Mesh unitBox = GetUnitBoxMesh();
-            var groups = new Dictionary<string, FootprintMaterialGroup>(System.StringComparer.Ordinal);
+            Mesh unitBox = GetFacadeRoofUnitBoxMesh();
+            var groups = new Dictionary<BuildingCategory, FootprintCategoryGroup>();
 
             foreach (Transform building in buildings)
             {
                 if (building == null || !TryGetFloorExtrusionMatrix(building, out Matrix4x4 extrusionMatrix))
                     continue;
 
-                Material material = fallbackMaterial;
-                string groupKey = material != null
-                    ? BuildingSurfaceUtility.NormalizeMaterialName(material.name)
-                    : "proxy";
-
+                BuildingCategory category = BuildingCategory.House;
                 if (settings != null &&
-                    SpatialBuildingMaterialApplier.TryResolveBuildingProxySurface(
-                        building, tileId, settings, out Material resolved, out string combinedKey))
+                    SpatialBuildingMaterialApplier.TryResolveBuildingProxyMaterials(
+                        building,
+                        tileId,
+                        settings,
+                        out _,
+                        out _,
+                        out string combinedKey) &&
+                    BuildingSurfaceUtility.TryResolveCategoryAndSurfaceFromSlotKey(
+                        combinedKey,
+                        out BuildingCategory resolvedCategory,
+                        out _))
                 {
-                    material = resolved;
-                    groupKey = combinedKey;
+                    category = resolvedCategory;
                 }
 
-                if (material == null)
-                    continue;
-
-                if (!groups.TryGetValue(groupKey, out FootprintMaterialGroup group))
+                if (!groups.TryGetValue(category, out FootprintCategoryGroup group))
                 {
-                    group = new FootprintMaterialGroup { Material = material };
-                    groups[groupKey] = group;
+                    group = new FootprintCategoryGroup { Category = category };
+                    groups[category] = group;
                 }
 
                 Matrix4x4 localMatrix = bakeRoot.worldToLocalMatrix * extrusionMatrix;
-                group.Instances.Add(new CombineInstance
+                group.FacadeInstances.Add(new CombineInstance
                 {
                     mesh = unitBox,
-                    subMeshIndex = 0,
+                    transform = localMatrix,
+                });
+                group.RoofInstances.Add(new CombineInstance
+                {
+                    mesh = unitBox,
                     transform = localMatrix,
                 });
             }
@@ -98,25 +112,51 @@ namespace ZGConnect.SpatialStreaming
             root.transform.localScale = Vector3.one;
 
             int groupIndex = 0;
-            foreach (KeyValuePair<string, FootprintMaterialGroup> kvp in groups)
+            foreach (KeyValuePair<BuildingCategory, FootprintCategoryGroup> kvp in groups)
             {
-                FootprintMaterialGroup group = kvp.Value;
-                if (group.Instances.Count == 0)
-                    continue;
+                FootprintCategoryGroup group = kvp.Value;
+                BuildingCategory category = group.Category;
+                BuildingSurfaceMaterialType roofSurface = SpatialBuildingMaterialApplier.ResolveProxyRoofSurfaceType(
+                    settings,
+                    category);
 
-                Mesh combined = SpatialMeshCombineUtility.CombineMeshesInSpace(
-                    group.Instances,
-                    mergeSubMeshes: true,
-                    $"FootprintProxy_{groupIndex++}",
-                    ownedMeshes);
+                if (TryCombineFootprintSubmesh(
+                        group.FacadeInstances,
+                        subMeshIndex: 0,
+                        mergeSubMeshes: true,
+                        BuildFootprintProxyMeshName(category, BuildingSurfaceMaterialType.Facade),
+                        ownedMeshes,
+                        out Mesh facadeMesh) &&
+                    facadeMesh != null)
+                {
+                    CreateCombinedProxyRenderer(
+                        root.transform,
+                        BuildCombinedProxyObjectName(category, BuildingSurfaceMaterialType.Facade),
+                        facadeMesh,
+                        category,
+                        BuildingSurfaceMaterialType.Facade,
+                        fallbackMaterial);
+                }
 
-                if (combined == null)
-                    continue;
+                if (TryCombineFootprintSubmesh(
+                        group.RoofInstances,
+                        subMeshIndex: 1,
+                        mergeSubMeshes: true,
+                        BuildFootprintProxyMeshName(category, roofSurface),
+                        ownedMeshes,
+                        out Mesh roofMesh) &&
+                    roofMesh != null)
+                {
+                    CreateCombinedProxyRenderer(
+                        root.transform,
+                        BuildCombinedProxyObjectName(category, roofSurface),
+                        roofMesh,
+                        category,
+                        roofSurface,
+                        fallbackMaterial);
+                }
 
-                var child = new GameObject($"Combined_{kvp.Key}");
-                child.transform.SetParent(root.transform, false);
-                child.AddComponent<MeshFilter>().sharedMesh = combined;
-                child.AddComponent<MeshRenderer>().sharedMaterial = group.Material;
+                groupIndex++;
             }
 
             return root.transform.childCount > 0 ? root : null;
@@ -125,36 +165,26 @@ namespace ZGConnect.SpatialStreaming
         public static bool TryGetFloorExtrusionMatrix(Transform building, out Matrix4x4 worldMatrix)
         {
             worldMatrix = Matrix4x4.identity;
-            if (building == null ||
-                !TryComputeFloorExtrusion(building, out Vector3 centerLocal, out Vector3 sizeLocal, out Quaternion rotationLocal))
-            {
+            if (building == null || !TryComputeFloorExtrusion(building, out worldMatrix))
                 return false;
-            }
 
-            worldMatrix = building.localToWorldMatrix * Matrix4x4.TRS(centerLocal, rotationLocal, sizeLocal);
             return true;
         }
 
-        static bool TryComputeFloorExtrusion(
-            Transform building,
-            out Vector3 centerLocal,
-            out Vector3 sizeLocal,
-            out Quaternion rotationLocal)
+        static bool TryComputeFloorExtrusion(Transform building, out Matrix4x4 worldMatrix)
         {
-            centerLocal = Vector3.zero;
-            sizeLocal = Vector3.one;
-            rotationLocal = Quaternion.identity;
+            worldMatrix = Matrix4x4.identity;
 
-            var points = new List<Vector3>(256);
-            CollectBuildingPointsLocal(building, points);
-            if (points.Count == 0)
+            var worldPoints = new List<Vector3>(512);
+            CollectBuildingPointsWorld(building, worldPoints);
+            if (worldPoints.Count == 0)
                 return false;
 
             float minY = float.MaxValue;
             float maxY = float.MinValue;
-            for (int i = 0; i < points.Count; i++)
+            for (int i = 0; i < worldPoints.Count; i++)
             {
-                float y = points[i].y;
+                float y = worldPoints[i].y;
                 minY = Mathf.Min(minY, y);
                 maxY = Mathf.Max(maxY, y);
             }
@@ -164,58 +194,103 @@ namespace ZGConnect.SpatialStreaming
                 return false;
 
             float floorCeiling = minY + Mathf.Max(FloorBandMinMeters, height * FloorBandHeightRatio);
-            var footprint = new List<Vector2>(128);
-            for (int i = 0; i < points.Count; i++)
+            float yawDegrees = building.eulerAngles.y;
+            Quaternion buildingYaw = Quaternion.Euler(0f, yawDegrees, 0f);
+            Quaternion invBuildingYaw = Quaternion.Inverse(buildingYaw);
+            Vector3 buildingOrigin = building.position;
+
+            var localFootprint = new List<Vector2>(128);
+            for (int i = 0; i < worldPoints.Count; i++)
             {
-                Vector3 point = points[i];
-                if (point.y <= floorCeiling)
-                    footprint.Add(new Vector2(point.x, point.z));
+                Vector3 point = worldPoints[i];
+                if (point.y > floorCeiling)
+                    continue;
+
+                Vector3 local = invBuildingYaw * (point - buildingOrigin);
+                localFootprint.Add(new Vector2(local.x, local.z));
             }
 
-            if (footprint.Count < 3)
+            if (localFootprint.Count < 3)
             {
-                footprint.Clear();
-                for (int i = 0; i < points.Count; i++)
-                    footprint.Add(new Vector2(points[i].x, points[i].z));
+                localFootprint.Clear();
+                for (int i = 0; i < worldPoints.Count; i++)
+                {
+                    Vector3 local = invBuildingYaw * (worldPoints[i] - buildingOrigin);
+                    localFootprint.Add(new Vector2(local.x, local.z));
+                }
             }
 
-            ComputeOrientedFootprint(footprint, out Vector2 footprintCenter, out Vector2 halfExtents, out float yawRadians);
+            if (localFootprint.Count == 0)
+                return false;
 
-            sizeLocal = new Vector3(
-                Mathf.Max(MinFootprintMeters, halfExtents.x * 2f),
+            ComputeBuildingLocalFootprintExtents(
+                localFootprint,
+                out Vector2 localCenter,
+                out Vector2 localHalfExtents);
+
+            Vector3 worldCenter = buildingOrigin + buildingYaw * new Vector3(localCenter.x, 0f, localCenter.y);
+            worldCenter.y = minY + Mathf.Max(MinHeightMeters, height) * 0.5f;
+
+            Vector3 size = new Vector3(
+                Mathf.Max(MinFootprintMeters, localHalfExtents.x * 2f),
                 Mathf.Max(MinHeightMeters, height),
-                Mathf.Max(MinFootprintMeters, halfExtents.y * 2f));
+                Mathf.Max(MinFootprintMeters, localHalfExtents.y * 2f));
 
-            centerLocal = new Vector3(
-                footprintCenter.x,
-                minY + sizeLocal.y * 0.5f,
-                footprintCenter.y);
-
-            rotationLocal = Quaternion.Euler(0f, yawRadians * Mathf.Rad2Deg, 0f);
+            worldMatrix = Matrix4x4.TRS(worldCenter, buildingYaw, size);
             return true;
         }
 
-        static void CollectBuildingPointsLocal(Transform building, List<Vector3> points)
+        static void ComputeBuildingLocalFootprintExtents(
+            List<Vector2> localFootprint,
+            out Vector2 localCenter,
+            out Vector2 localHalfExtents)
         {
-            Matrix4x4 toBuilding = building.worldToLocalMatrix;
+            localCenter = Vector2.zero;
+            localHalfExtents = new Vector2(MinFootprintMeters * 0.5f, MinFootprintMeters * 0.5f);
 
+            if (localFootprint == null || localFootprint.Count == 0)
+                return;
+
+            float minX = float.MaxValue;
+            float maxX = float.MinValue;
+            float minZ = float.MaxValue;
+            float maxZ = float.MinValue;
+            for (int i = 0; i < localFootprint.Count; i++)
+            {
+                Vector2 point = localFootprint[i];
+                minX = Mathf.Min(minX, point.x);
+                maxX = Mathf.Max(maxX, point.x);
+                minZ = Mathf.Min(minZ, point.y);
+                maxZ = Mathf.Max(maxZ, point.y);
+            }
+
+            localCenter = new Vector2((minX + maxX) * 0.5f, (minZ + maxZ) * 0.5f);
+            localHalfExtents = new Vector2(
+                Mathf.Max(MinFootprintMeters * 0.5f, (maxX - minX) * 0.5f),
+                Mathf.Max(MinFootprintMeters * 0.5f, (maxZ - minZ) * 0.5f));
+        }
+
+        static void CollectBuildingPointsWorld(Transform building, List<Vector3> points)
+        {
             foreach (MeshFilter filter in building.GetComponentsInChildren<MeshFilter>(true))
             {
                 if (filter?.sharedMesh == null)
                     continue;
 
-                Matrix4x4 meshToBuilding = toBuilding * filter.transform.localToWorldMatrix;
+                Matrix4x4 meshToWorld = filter.transform.localToWorldMatrix;
                 Mesh mesh = filter.sharedMesh;
+                if (TryAppendMeshVertices(meshToWorld, mesh, points))
+                    continue;
+
                 if (mesh.isReadable)
                 {
                     Vector3[] vertices = mesh.vertices;
                     for (int i = 0; i < vertices.Length; i++)
-                        points.Add(meshToBuilding.MultiplyPoint3x4(vertices[i]));
+                        points.Add(meshToWorld.MultiplyPoint(vertices[i]));
+                    continue;
                 }
-                else
-                {
-                    AppendBoundsCorners(meshToBuilding, mesh.bounds, points);
-                }
+
+                AppendBoundsCorners(meshToWorld, mesh.bounds, points);
             }
 
             if (points.Count > 0)
@@ -223,8 +298,10 @@ namespace ZGConnect.SpatialStreaming
 
             foreach (MeshRenderer renderer in building.GetComponentsInChildren<MeshRenderer>(true))
             {
-                if (renderer != null)
-                    AppendWorldBoundsCorners(toBuilding, renderer.bounds, points);
+                if (renderer == null)
+                    continue;
+
+                AppendWorldBoundsCorners(renderer.bounds, points);
             }
         }
 
@@ -236,103 +313,197 @@ namespace ZGConnect.SpatialStreaming
             for (int iy = 0; iy < 2; iy++)
             for (int iz = 0; iz < 2; iz++)
             {
-                points.Add(matrix.MultiplyPoint3x4(new Vector3(
+                points.Add(matrix.MultiplyPoint(new Vector3(
                     ix == 0 ? min.x : max.x,
                     iy == 0 ? min.y : max.y,
                     iz == 0 ? min.z : max.z)));
             }
         }
 
-        static void AppendWorldBoundsCorners(Matrix4x4 matrix, Bounds bounds, List<Vector3> points) =>
-            AppendBoundsCorners(matrix, bounds, points);
-
-        static void ComputeOrientedFootprint(
-            List<Vector2> points,
-            out Vector2 center,
-            out Vector2 halfExtents,
-            out float yawRadians)
+        static void AppendWorldBoundsCorners(Bounds bounds, List<Vector3> points)
         {
-            center = Vector2.zero;
-            halfExtents = new Vector2(MinFootprintMeters * 0.5f, MinFootprintMeters * 0.5f);
-            yawRadians = 0f;
+            Vector3 min = bounds.min;
+            Vector3 max = bounds.max;
+            for (int ix = 0; ix < 2; ix++)
+            for (int iy = 0; iy < 2; iy++)
+            for (int iz = 0; iz < 2; iz++)
+            {
+                points.Add(new Vector3(
+                    ix == 0 ? min.x : max.x,
+                    iy == 0 ? min.y : max.y,
+                    iz == 0 ? min.z : max.z));
+            }
+        }
 
-            if (points == null || points.Count == 0)
+        static bool TryAppendMeshVertices(Matrix4x4 matrix, Mesh mesh, List<Vector3> points)
+        {
+            if (mesh == null)
+                return false;
+
+            using Mesh.MeshDataArray dataArray = Mesh.AcquireReadOnlyMeshData(mesh);
+            if (dataArray.Length == 0)
+                return false;
+
+            Mesh.MeshData data = dataArray[0];
+            int vertCount = data.vertexCount;
+            if (vertCount == 0)
+                return false;
+
+            var vertices = new NativeArray<Vector3>(vertCount, Allocator.Temp);
+            try
+            {
+                data.GetVertices(vertices);
+                for (int i = 0; i < vertCount; i++)
+                    points.Add(matrix.MultiplyPoint(vertices[i]));
+            }
+            finally
+            {
+                vertices.Dispose();
+            }
+
+            return true;
+        }
+
+        static bool TryCombineFootprintSubmesh(
+            List<CombineInstance> boxInstances,
+            int subMeshIndex,
+            bool mergeSubMeshes,
+            string meshName,
+            ICollection<Mesh> ownedMeshes,
+            out Mesh combinedMesh)
+        {
+            combinedMesh = null;
+            if (boxInstances == null || boxInstances.Count == 0)
+                return false;
+
+            var submeshInstances = new List<CombineInstance>(boxInstances.Count);
+            foreach (CombineInstance instance in boxInstances)
+            {
+                if (instance.mesh == null)
+                    continue;
+
+                submeshInstances.Add(new CombineInstance
+                {
+                    mesh = instance.mesh,
+                    subMeshIndex = subMeshIndex,
+                    transform = instance.transform,
+                });
+            }
+
+            if (submeshInstances.Count == 0)
+                return false;
+
+            combinedMesh = SpatialMeshCombineUtility.CombineMeshesInSpace(
+                submeshInstances,
+                mergeSubMeshes,
+                meshName,
+                ownedMeshes);
+            return combinedMesh != null;
+        }
+
+        static void CreateCombinedProxyRenderer(
+            Transform parent,
+            string objectName,
+            Mesh mesh,
+            BuildingCategory category,
+            BuildingSurfaceMaterialType surfaceType,
+            Material placeholderMaterial)
+        {
+            if (parent == null || mesh == null)
                 return;
 
-            for (int i = 0; i < points.Count; i++)
-                center += points[i];
-            center /= points.Count;
+            var child = new GameObject(objectName);
+            child.transform.SetParent(parent, false);
+            child.AddComponent<MeshFilter>().sharedMesh = mesh;
+            var renderer = child.AddComponent<MeshRenderer>();
+            if (placeholderMaterial != null)
+                renderer.sharedMaterial = placeholderMaterial;
 
-            float cxx = 0f;
-            float czz = 0f;
-            float cxz = 0f;
-            for (int i = 0; i < points.Count; i++)
-            {
-                float x = points[i].x - center.x;
-                float z = points[i].y - center.y;
-                cxx += x * x;
-                czz += z * z;
-                cxz += x * z;
-            }
-
-            float invCount = 1f / points.Count;
-            cxx *= invCount;
-            czz *= invCount;
-            cxz *= invCount;
-
-            Vector2 axis1;
-            if (Mathf.Abs(cxz) > 1e-6f)
-            {
-                float trace = cxx + czz;
-                float det = cxx * czz - cxz * cxz;
-                float lambda1 = trace * 0.5f + Mathf.Sqrt(Mathf.Max(0f, trace * trace * 0.25f - det));
-                axis1 = new Vector2(lambda1 - czz, cxz);
-                if (axis1.sqrMagnitude < 1e-8f)
-                    axis1 = Vector2.right;
-                axis1.Normalize();
-            }
-            else
-            {
-                axis1 = cxx >= czz ? Vector2.right : Vector2.up;
-            }
-
-            Vector2 axis2 = new Vector2(-axis1.y, axis1.x);
-
-            float min1 = float.MaxValue;
-            float max1 = float.MinValue;
-            float min2 = float.MaxValue;
-            float max2 = float.MinValue;
-            for (int i = 0; i < points.Count; i++)
-            {
-                Vector2 delta = points[i] - center;
-                float proj1 = Vector2.Dot(delta, axis1);
-                float proj2 = Vector2.Dot(delta, axis2);
-                min1 = Mathf.Min(min1, proj1);
-                max1 = Mathf.Max(max1, proj1);
-                min2 = Mathf.Min(min2, proj2);
-                max2 = Mathf.Max(max2, proj2);
-            }
-
-            halfExtents = new Vector2(
-                Mathf.Max(MinFootprintMeters * 0.5f, (max1 - min1) * 0.5f),
-                Mathf.Max(MinFootprintMeters * 0.5f, (max2 - min2) * 0.5f));
-
-            center += axis1 * ((min1 + max1) * 0.5f) + axis2 * ((min2 + max2) * 0.5f);
-            yawRadians = Mathf.Atan2(axis1.y, axis1.x);
+            var hint = child.AddComponent<SpatialFootprintProxySurfaceHint>();
+            hint.category = category;
+            hint.surfaceType = surfaceType;
         }
 
-        sealed class FootprintMaterialGroup
+        public static string BuildFootprintProxyMeshName(
+            BuildingCategory category,
+            BuildingSurfaceMaterialType surfaceType) =>
+            "FootprintProxy_" +
+            BuildingSurfaceUtility.CategoryToSlotToken(category) + "_" +
+            BuildingSurfaceUtility.SurfaceToSlotToken(surfaceType);
+
+        public static string BuildCombinedProxyObjectName(
+            BuildingCategory category,
+            BuildingSurfaceMaterialType surfaceType)
         {
-            public Material Material;
-            public readonly List<CombineInstance> Instances = new();
+            string slot = BuildingSurfaceUtility.CategoryToSlotToken(category) + "_" +
+                          BuildingSurfaceUtility.SurfaceToSlotToken(surfaceType);
+            return "Combined_" + slot;
         }
 
-        static Mesh GetUnitBoxMesh()
+        public static bool TryResolveProxySurfaceHint(
+            MeshRenderer renderer,
+            out BuildingCategory category,
+            out BuildingSurfaceMaterialType surfaceType)
         {
-            if (_unitBoxMesh != null)
-                return _unitBoxMesh;
+            category = BuildingCategory.House;
+            surfaceType = BuildingSurfaceMaterialType.Facade;
 
-            var mesh = new Mesh { name = "SpatialFootprintUnitBox" };
+            if (renderer == null)
+                return false;
+
+            if (renderer.TryGetComponent(out SpatialFootprintProxySurfaceHint hint))
+            {
+                category = hint.category;
+                surfaceType = hint.surfaceType;
+                return true;
+            }
+
+            MeshFilter filter = renderer.GetComponent<MeshFilter>();
+            string meshName = filter != null && filter.sharedMesh != null
+                ? filter.sharedMesh.name
+                : null;
+
+            if (!string.IsNullOrEmpty(meshName) &&
+                meshName.StartsWith("FootprintProxy_", System.StringComparison.Ordinal))
+            {
+                string slotKey = meshName.Substring("FootprintProxy_".Length);
+                if (BuildingSurfaceUtility.TryResolveCategoryAndSurfaceFromSlotKey(
+                        slotKey,
+                        out category,
+                        out surfaceType))
+                {
+                    return true;
+                }
+            }
+
+            if (BuildingSurfaceUtility.TryResolveCategoryAndSurfaceFromSlotKey(
+                    StripCombinedNamePrefix(renderer.gameObject.name),
+                    out category,
+                    out surfaceType))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        static string StripCombinedNamePrefix(string objectName)
+        {
+            if (string.IsNullOrEmpty(objectName))
+                return objectName;
+
+            const string prefix = "Combined_";
+            return objectName.StartsWith(prefix, System.StringComparison.Ordinal)
+                ? objectName.Substring(prefix.Length)
+                : objectName;
+        }
+
+        static Mesh GetFacadeRoofUnitBoxMesh()
+        {
+            if (_facadeRoofUnitBoxMesh != null)
+                return _facadeRoofUnitBoxMesh;
+
+            var mesh = new Mesh { name = "SpatialFootprintFacadeRoofUnitBox" };
             mesh.vertices = new[]
             {
                 new Vector3(-0.5f, -0.5f, -0.5f), new Vector3(0.5f, -0.5f, -0.5f),
@@ -340,19 +511,25 @@ namespace ZGConnect.SpatialStreaming
                 new Vector3(-0.5f, -0.5f, 0.5f), new Vector3(0.5f, -0.5f, 0.5f),
                 new Vector3(0.5f, 0.5f, 0.5f), new Vector3(-0.5f, 0.5f, 0.5f),
             };
-            mesh.triangles = new[]
+
+            mesh.subMeshCount = 2;
+            mesh.SetTriangles(new[]
             {
                 0, 2, 1, 0, 3, 2,
                 1, 6, 5, 1, 2, 6,
                 5, 7, 4, 5, 6, 7,
                 4, 3, 0, 4, 7, 3,
-                3, 6, 2, 3, 7, 6,
                 4, 1, 5, 4, 0, 1,
-            };
+            }, 0);
+            mesh.SetTriangles(new[]
+            {
+                3, 6, 2, 3, 7, 6,
+            }, 1);
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
-            _unitBoxMesh = mesh;
-            return _unitBoxMesh;
+            mesh.UploadMeshData(markNoLongerReadable: false);
+            _facadeRoofUnitBoxMesh = mesh;
+            return _facadeRoofUnitBoxMesh;
         }
     }
 }

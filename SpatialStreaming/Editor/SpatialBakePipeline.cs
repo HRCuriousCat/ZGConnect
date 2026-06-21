@@ -22,7 +22,8 @@ namespace ZGConnect.SpatialStreaming.Editor
 
         public static IEnumerator BakeCoroutine(
             SpatialBakeProfile profile,
-            Action<float, string> onProgress,
+            SpatialBakeProgressTracker progressTracker,
+            Action<SpatialBakeProgress> onProgress,
             BakeReport report,
             IReadOnlyList<string> runtimeTileFilter = null)
         {
@@ -36,6 +37,10 @@ namespace ZGConnect.SpatialStreaming.Editor
                 report.Message = "Bake profile is null.";
                 yield break;
             }
+
+            progressTracker?.ResetForFullBake(profile);
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.Prepare, 0f, detail: "Cleaning staging...");
+            yield return null;
 
             string parentManifestPath = SpatialStreamingPaths.ParentManifestPath();
             if (!SpatialParentManifestReader.TryLoad(
@@ -74,6 +79,8 @@ namespace ZGConnect.SpatialStreaming.Editor
             string stagingRoot = SpatialStreamingPaths.SpatialStagingAssetRoot;
             ZGConnectPathUtils.EnsureAssetFolder(stagingRoot);
             SpatialBakeStagingUtility.CleanStaging();
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.Prepare, 1f, detail: "Staging ready");
+            yield return null;
 
             var manifest = new SpatialDatasetManifest
             {
@@ -119,7 +126,14 @@ namespace ZGConnect.SpatialStreaming.Editor
                     continue;
 
                 doneTiles++;
-                onProgress?.Invoke((float)doneTiles / Mathf.Max(totalTiles, 1), parentTile.TileId);
+                ReportProgress(
+                    progressTracker,
+                    onProgress,
+                    SpatialBakeStage.Tiles,
+                    (float)(doneTiles - 1) / Mathf.Max(totalTiles, 1),
+                    doneTiles,
+                    totalTiles,
+                    $"Loading {parentTile.TileId}");
 
                 string glbPath = Path.Combine(
                     datasetRoot,
@@ -159,6 +173,18 @@ namespace ZGConnect.SpatialStreaming.Editor
                         tileSizeMeters,
                         buildingMeta,
                         manifestUnityOrigin);
+
+                    if (profile.buildingSurfaceSettings != null)
+                    {
+                        SpatialBuildingSurfaceBakeUtility.PrepareTileBuildingsForSurfaceMaterials(
+                            tileRoot.transform,
+                            parentTile.TileId,
+                            parentTile.UnityPosition,
+                            tileSizeMeters,
+                            buildingMeta,
+                            profile.buildingSurfaceSettings,
+                            profile.verboseBakeLogging);
+                    }
 
                     SpatialBuildingSubcellSplitter.SplitResult split =
                         SpatialBuildingSubcellSplitter.SplitTileBuildings(
@@ -221,10 +247,25 @@ namespace ZGConnect.SpatialStreaming.Editor
                     }
                     else
                     {
+                        int subcellTotal = split.Subcells.Count;
+                        int subcellDone = 0;
                         foreach (KeyValuePair<string, List<Transform>> kvp in split.Subcells)
                         {
                             if (!TryParseSubcellId(kvp.Key, out int gx, out int gy))
                                 continue;
+
+                            subcellDone++;
+                            float tileStageProgress =
+                                ((doneTiles - 1) + (float)subcellDone / Mathf.Max(1, subcellTotal)) /
+                                Mathf.Max(1, totalTiles);
+                            ReportProgress(
+                                progressTracker,
+                                onProgress,
+                                SpatialBakeStage.Tiles,
+                                tileStageProgress,
+                                subcellDone,
+                                subcellTotal,
+                                $"{parentTile.TileId} {kvp.Key}");
 
                             var subcellRoot = new GameObject($"Subcell_{parentTile.TileId}_{kvp.Key}");
                             subcellRoot.transform.SetParent(tileRoot.transform, false);
@@ -254,7 +295,8 @@ namespace ZGConnect.SpatialStreaming.Editor
 
                             if (profile.detailBundleMode == SpatialDetailBundleMode.MeshAssets)
                             {
-                                bakedDetail = TryBakeSubcellMeshDetailAsset(
+                                var meshDetailState = new MeshDetailBakeState();
+                                IEnumerator meshDetailRoutine = TryBakeSubcellMeshDetailAssetCoroutine(
                                     profile,
                                     parentTile.TileId,
                                     kvp.Key,
@@ -263,10 +305,15 @@ namespace ZGConnect.SpatialStreaming.Editor
                                     subcellRoot.transform,
                                     duplicatedBuildings,
                                     stagingRoot,
-                                    out detailAssetPath,
-                                    out bundleName,
-                                    out buildingCount,
-                                    out bakeError);
+                                    meshDetailState);
+                                while (meshDetailRoutine.MoveNext())
+                                    yield return meshDetailRoutine.Current;
+
+                                bakedDetail = meshDetailState.Success;
+                                detailAssetPath = meshDetailState.DetailAssetPath;
+                                bundleName = meshDetailState.BundleName;
+                                buildingCount = meshDetailState.BuildingCount;
+                                bakeError = meshDetailState.Error;
                                 loadKind = SpatialSubcellManifestEntry.MeshDetailLoadKind;
                             }
                             else
@@ -363,6 +410,7 @@ namespace ZGConnect.SpatialStreaming.Editor
                             }
 
                             UnityEngine.Object.DestroyImmediate(subcellRoot);
+                            yield return null;
                         }
 
                         if (tileEntry.Subcells.Count == 0)
@@ -424,6 +472,9 @@ namespace ZGConnect.SpatialStreaming.Editor
                 yield return null;
             }
 
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.Tiles, 1f, totalTiles, totalTiles, "Tiles complete");
+            yield return null;
+
             if (bundleBuilds.Count == 0)
             {
                 report.Message =
@@ -433,29 +484,59 @@ namespace ZGConnect.SpatialStreaming.Editor
                 yield break;
             }
 
-            onProgress?.Invoke(0.88f, "Building HLOD supertiles...");
-            yield return null;
-
-            SpatialSupertileBakeUtility.BakeSupertiles(
-                profile,
-                tileSizeMeters,
-                bakedTileProxies,
-                manifest,
-                bundleBuilds,
-                stagingRoot);
-
-            onProgress?.Invoke(0.9f, "Building AssetBundles...");
-            yield return null;
-
-            if (!SpatialStagingBundleUtility.BuildAndCopyBundlesBatched(
-                    profile,
-                    bundleBuilds,
-                    onProgress,
-                    out string buildError))
+            if (profile.bakeHlodSupertiles)
             {
-                report.Message = buildError;
+                IEnumerator hlodRoutine = SpatialSupertileBakeUtility.BakeSupertilesCoroutine(
+                    profile,
+                    tileSizeMeters,
+                    bakedTileProxies,
+                    manifest,
+                    bundleBuilds,
+                    stagingRoot,
+                    (hlodProgress, hlodDetail) =>
+                    {
+                        ReportProgress(
+                            progressTracker,
+                            onProgress,
+                            SpatialBakeStage.Hlod,
+                            hlodProgress,
+                            detail: hlodDetail);
+                    });
+                while (hlodRoutine.MoveNext())
+                    yield return hlodRoutine.Current;
+
+                ReportProgress(progressTracker, onProgress, SpatialBakeStage.Hlod, 1f, detail: "HLOD complete");
+                yield return null;
+            }
+
+            var bundleResult = new SpatialStagingBundleUtility.SpatialBundleBatchResult();
+            IEnumerator bundleRoutine = SpatialStagingBundleUtility.BuildAndCopyBundlesBatchedCoroutine(
+                profile,
+                bundleBuilds,
+                (bundleProgress, bundleDetail) =>
+                {
+                    ReportProgress(
+                        progressTracker,
+                        onProgress,
+                        SpatialBakeStage.AssetBundles,
+                        bundleProgress,
+                        detail: bundleDetail);
+                },
+                bundleResult);
+            while (bundleRoutine.MoveNext())
+                yield return bundleRoutine.Current;
+
+            if (!bundleResult.Succeeded)
+            {
+                report.Message = bundleResult.Error;
                 yield break;
             }
+
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.AssetBundles, 1f, detail: "Bundles copied");
+            yield return null;
+
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.Manifest, 0.2f, detail: "Writing manifest...");
+            yield return null;
 
             string manifestPath = SpatialStreamingPaths.SpatialManifestPath();
             if (selected.Count > 0)
@@ -470,19 +551,22 @@ namespace ZGConnect.SpatialStreaming.Editor
                 $"Baked {report.SubcellsBaked} bundle(s) across {report.TilesProcessed} tile(s). " +
                 $"Manifest: {manifestPath}";
             SpatialBakeVerboseLog.Global("complete", report.Message);
-            onProgress?.Invoke(1f, "Done");
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.Manifest, 1f, detail: "Done");
         }
 
         public static IEnumerator BuildBundlesFromStagingCoroutine(
             SpatialBakeProfile profile,
             bool rebuildManifest,
-            Action<float, string> onProgress,
+            SpatialBakeProgressTracker progressTracker,
+            Action<SpatialBakeProgress> onProgress,
             BakeReport report)
         {
             report ??= new BakeReport();
             report.TilesProcessed = 0;
             report.SubcellsBaked = 0;
             report.TilesFailed = 0;
+
+            progressTracker?.ResetForStagingBuild(rebuildManifest);
 
             string stagingRoot = SpatialStreamingPaths.SpatialStagingAssetRoot;
             int stagedPrefabs = SpatialStagingBundleUtility.CountStagedPrefabs(stagingRoot);
@@ -492,7 +576,12 @@ namespace ZGConnect.SpatialStreaming.Editor
                 yield break;
             }
 
-            onProgress?.Invoke(0.05f, $"Collecting {stagedPrefabs} staged spatial asset(s)...");
+            ReportProgress(
+                progressTracker,
+                onProgress,
+                SpatialBakeStage.CollectStaging,
+                0.2f,
+                detail: $"Collecting {stagedPrefabs} staged asset(s)...");
             yield return null;
 
             List<AssetBundleBuild> builds = SpatialStagingBundleUtility.CollectBundleBuildsFromStaging(stagingRoot);
@@ -503,22 +592,45 @@ namespace ZGConnect.SpatialStreaming.Editor
             }
 
             report.SubcellsBaked = builds.Count;
-            onProgress?.Invoke(0.1f, $"Building {builds.Count} bundle(s) in batches...");
+            ReportProgress(
+                progressTracker,
+                onProgress,
+                SpatialBakeStage.CollectStaging,
+                1f,
+                builds.Count,
+                builds.Count,
+                $"Mapped {builds.Count} bundle(s)");
             yield return null;
 
-            if (!SpatialStagingBundleUtility.BuildAndCopyBundlesBatched(
-                    profile,
-                    builds,
-                    (progress, detail) => onProgress?.Invoke(0.1f + progress * 0.85f, detail),
-                    out string buildError))
+            var bundleResult = new SpatialStagingBundleUtility.SpatialBundleBatchResult();
+            IEnumerator bundleRoutine = SpatialStagingBundleUtility.BuildAndCopyBundlesBatchedCoroutine(
+                profile,
+                builds,
+                (bundleProgress, bundleDetail) =>
+                {
+                    ReportProgress(
+                        progressTracker,
+                        onProgress,
+                        SpatialBakeStage.AssetBundles,
+                        bundleProgress,
+                        detail: bundleDetail);
+                },
+                bundleResult);
+            while (bundleRoutine.MoveNext())
+                yield return bundleRoutine.Current;
+
+            if (!bundleResult.Succeeded)
             {
-                report.Message = buildError;
+                report.Message = bundleResult.Error;
                 yield break;
             }
 
+            ReportProgress(progressTracker, onProgress, SpatialBakeStage.AssetBundles, 1f, detail: "Bundles copied");
+            yield return null;
+
             if (rebuildManifest)
             {
-                onProgress?.Invoke(0.96f, "Rebuilding spatial_manifest.json from staging...");
+                ReportProgress(progressTracker, onProgress, SpatialBakeStage.Manifest, 0.3f, detail: "Rebuilding manifest...");
                 yield return null;
 
                 SpatialDatasetManifest manifest =
@@ -535,7 +647,12 @@ namespace ZGConnect.SpatialStreaming.Editor
                 $"Built {builds.Count} bundle(s) from staging into {SpatialStreamingPaths.SpatialBundlesRoot}" +
                 (rebuildManifest ? $" and updated {SpatialStreamingPaths.SpatialManifestRelativePath}" : ".");
             SpatialBakeVerboseLog.Global("staging-recovery-complete", report.Message);
-            onProgress?.Invoke(1f, "Done");
+            ReportProgress(
+                progressTracker,
+                onProgress,
+                SpatialBakeStage.Manifest,
+                1f,
+                detail: "Done");
         }
 
         static void MergeManifestWithExisting(
@@ -559,8 +676,13 @@ namespace ZGConnect.SpatialStreaming.Editor
                 if (tile == null || string.IsNullOrEmpty(tile.TileId))
                     continue;
 
-                if (!bakedTileIds.Contains(tile.TileId))
-                    mergedTiles.Add(tile);
+                if (bakedTileIds.Contains(tile.TileId))
+                    continue;
+
+                if (!SpatialStagingBundleUtility.TileEntryHasBundleOnDisk(tile))
+                    continue;
+
+                mergedTiles.Add(tile);
             }
 
             if (baked.Tiles != null)
@@ -649,7 +771,39 @@ namespace ZGConnect.SpatialStreaming.Editor
             return File.Exists(glbPath);
         }
 
-        static bool TryBakeSubcellMeshDetailAsset(
+        sealed class MeshDetailBakeState
+        {
+            public bool Success;
+            public string DetailAssetPath;
+            public string BundleName;
+            public int BuildingCount;
+            public string Error;
+        }
+
+        static void ReportProgress(
+            SpatialBakeProgressTracker tracker,
+            Action<SpatialBakeProgress> onProgress,
+            SpatialBakeStage stage,
+            float stageProgress,
+            int current = 0,
+            int total = 0,
+            string detail = null)
+        {
+            if (tracker == null)
+                return;
+
+            var progress = SpatialBakeProgress.Create(
+                stage,
+                stageProgress,
+                tracker.StageToOverall(stage, stageProgress),
+                current,
+                total,
+                detail);
+            tracker.Apply(progress);
+            onProgress?.Invoke(progress);
+        }
+
+        static IEnumerator TryBakeSubcellMeshDetailAssetCoroutine(
             SpatialBakeProfile profile,
             string tileId,
             string subcellId,
@@ -658,35 +812,35 @@ namespace ZGConnect.SpatialStreaming.Editor
             Transform bakeRoot,
             List<Transform> buildings,
             string stagingRoot,
-            out string detailAssetPath,
-            out string bundleName,
-            out int buildingCount,
-            out string error)
+            MeshDetailBakeState state)
         {
-            detailAssetPath = null;
-            bundleName = null;
-            buildingCount = buildings?.Count ?? 0;
-            error = null;
+            state.Success = false;
+            state.DetailAssetPath = null;
+            state.BundleName = null;
+            state.BuildingCount = buildings?.Count ?? 0;
+            state.Error = null;
 
             if (bakeRoot == null)
             {
-                error = "bakeRoot is null";
-                return false;
+                state.Error = "bakeRoot is null";
+                yield break;
             }
 
-            if (buildingCount == 0)
+            if (state.BuildingCount == 0)
             {
-                error = "no buildings in subcell";
-                return false;
+                state.Error = "no buildings in subcell";
+                yield break;
             }
 
             var ownedMeshes = new List<Mesh>();
             List<MeshRenderer> renderers = SpatialBuildingSubcellSplitter.CollectRenderers(buildings);
             if (renderers.Count == 0)
             {
-                error = "no MeshRenderers under buildings";
-                return false;
+                state.Error = "no MeshRenderers under buildings";
+                yield break;
             }
+
+            yield return null;
 
             int uniqueMaterialsBefore = SpatialMaterialCombineUtility.CountUniqueMaterials(renderers);
             int normalized = SpatialMaterialCombineUtility.NormalizeForCombine(
@@ -713,15 +867,18 @@ namespace ZGConnect.SpatialStreaming.Editor
 
             if (combinedRoot == null)
             {
-                error = "BuildCombinedRenderRoot returned null";
-                return false;
+                state.Error = "BuildCombinedRenderRoot returned null";
+                yield break;
             }
 
             if (combinedRoot.transform.childCount == 0)
             {
-                error = $"combined root has no render children (renderers={renderers.Count}, ownedMeshes={ownedMeshes.Count})";
-                return false;
+                state.Error =
+                    $"combined root has no render children (renderers={renderers.Count}, ownedMeshes={ownedMeshes.Count})";
+                yield break;
             }
+
+            yield return null;
 
             if (profile.buildingSurfaceSettings != null)
             {
@@ -746,19 +903,23 @@ namespace ZGConnect.SpatialStreaming.Editor
 
             string stagingFolder = $"{stagingRoot}/{tileId}";
             ZGConnectPathUtils.EnsureAssetFolder(stagingFolder);
-            detailAssetPath = $"{stagingFolder}/Spatial_{tileId}_{subcellId}_Detail.asset";
-            bundleName = $"{tileId}/{subcellId}";
+            state.DetailAssetPath = $"{stagingFolder}/Spatial_{tileId}_{subcellId}_Detail.asset";
+            state.BundleName = $"{tileId}/{subcellId}";
 
-            AssetDatabase.DeleteAsset(detailAssetPath);
+            AssetDatabase.DeleteAsset(state.DetailAssetPath);
+            yield return null;
 
             var detailAsset = ScriptableObject.CreateInstance<SpatialMeshDetailAsset>();
             detailAsset.TileId = tileId;
             detailAsset.SubcellId = subcellId;
-            AssetDatabase.CreateAsset(detailAsset, detailAssetPath);
+            AssetDatabase.CreateAsset(detailAsset, state.DetailAssetPath);
 
             var entries = new List<SpatialMeshDetailAsset.RendererEntry>();
-            foreach (MeshRenderer renderer in combinedRoot.GetComponentsInChildren<MeshRenderer>(true))
+            MeshRenderer[] combinedRenderers = combinedRoot.GetComponentsInChildren<MeshRenderer>(true);
+            const int renderersPerYield = 4;
+            for (int r = 0; r < combinedRenderers.Length; r++)
             {
+                MeshRenderer renderer = combinedRenderers[r];
                 if (renderer == null)
                     continue;
 
@@ -782,19 +943,24 @@ namespace ZGConnect.SpatialStreaming.Editor
                     Mesh = meshAsset,
                     Materials = materials,
                 });
+
+                if ((r + 1) % renderersPerYield == 0)
+                    yield return null;
             }
 
             if (entries.Count == 0)
             {
-                AssetDatabase.DeleteAsset(detailAssetPath);
-                error = "combined root produced no mesh detail renderer entries";
-                return false;
+                AssetDatabase.DeleteAsset(state.DetailAssetPath);
+                state.Error = "combined root produced no mesh detail renderer entries";
+                yield break;
             }
 
             detailAsset.Renderers = entries.ToArray();
             EditorUtility.SetDirty(detailAsset);
             AssetDatabase.SaveAssets();
-            AssetDatabase.ImportAsset(detailAssetPath);
+            yield return null;
+            AssetDatabase.ImportAsset(state.DetailAssetPath);
+            yield return null;
 
             if (profile.verboseBakeLogging)
             {
@@ -802,10 +968,10 @@ namespace ZGConnect.SpatialStreaming.Editor
                     tileId,
                     subcellId,
                     "mesh-detail-asset-ok",
-                    $"{detailAssetPath} renderers={entries.Count}");
+                    $"{state.DetailAssetPath} renderers={entries.Count}");
             }
 
-            return true;
+            state.Success = true;
         }
 
         static Material PersistMaterialReference(
@@ -1049,12 +1215,24 @@ namespace ZGConnect.SpatialStreaming.Editor
             return true;
         }
 
-        static AssetBundleBuild CreateBundleBuild(string bundleName, string prefabAssetPath) =>
-            new AssetBundleBuild
+        static AssetBundleBuild CreateBundleBuild(string bundleName, params string[] assetPaths)
+        {
+            var names = new List<string>();
+            if (assetPaths != null)
+            {
+                foreach (string path in assetPaths)
+                {
+                    if (!string.IsNullOrEmpty(path))
+                        names.Add(path);
+                }
+            }
+
+            return new AssetBundleBuild
             {
                 assetBundleName = bundleName,
-                assetNames = new[] { prefabAssetPath },
+                assetNames = names.ToArray(),
             };
+        }
 
         static bool TryParseSubcellId(string subcellId, out int gridX, out int gridY)
         {

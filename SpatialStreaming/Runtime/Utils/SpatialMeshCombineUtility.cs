@@ -222,6 +222,20 @@ namespace ZGConnect.SpatialStreaming
             return $"Combined_{BuildingSurfaceUtility.NormalizeMaterialName(material.name)}";
         }
 
+        public static Mesh EnsureReadableMesh(Mesh source, ICollection<Mesh> ownedClones = null)
+        {
+            if (source == null)
+                return null;
+
+            if (source.isReadable)
+                return source;
+
+            Mesh clone = CloneMeshGeometry(source);
+            if (clone != null)
+                ownedClones?.Add(clone);
+            return clone;
+        }
+
         static Mesh CloneMeshGeometry(Mesh source)
         {
             if (source == null)

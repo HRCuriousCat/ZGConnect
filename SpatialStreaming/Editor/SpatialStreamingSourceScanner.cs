@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -101,7 +102,48 @@ namespace ZGConnect.SpatialStreaming.Editor
                     "use 'Build bundles from staging' to finish without re-baking GLBs.");
             }
 
+            if (result.SpatialManifestExists && result.SpatialBundleFileCount > 0)
+            {
+                TryAddManifestBundleMismatchWarning(result);
+            }
+
             return result;
+        }
+
+        static void TryAddManifestBundleMismatchWarning(SpatialStreamingSourceScanResult result)
+        {
+            SpatialDatasetManifest manifest = SpatialDatasetManifest.LoadFromFile(result.SpatialManifestPath);
+            if (manifest?.Tiles == null || manifest.Tiles.Count == 0)
+                return;
+
+            int tilesOnDisk = 0;
+            string bundlesRoot = SpatialStreamingPaths.SpatialBundlesRoot;
+            if (Directory.Exists(bundlesRoot))
+            {
+                foreach (string tileDir in Directory.GetDirectories(bundlesRoot))
+                {
+                    string name = Path.GetFileName(tileDir);
+                    if (string.IsNullOrEmpty(name) || name.StartsWith("hlod", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (Directory.EnumerateFiles(tileDir).Any(path =>
+                            !path.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        tilesOnDisk++;
+                    }
+                }
+            }
+
+            SpatialTileManifestEntry firstTile = manifest.Tiles[0];
+            if (firstTile != null &&
+                !SpatialStagingBundleUtility.TileEntryHasBundleOnDisk(firstTile) &&
+                tilesOnDisk > 0 &&
+                tilesOnDisk < manifest.Tiles.Count)
+            {
+                result.Warnings.Add(
+                    $"spatial_manifest.json lists {manifest.Tiles.Count} tile(s) but ~{tilesOnDisk} have bundles on disk. " +
+                    "Use 'Sync manifest to bundles on disk' or re-bake missing tiles.");
+            }
         }
 
         static int CountSourceFiles(string folder, params string[] patterns)

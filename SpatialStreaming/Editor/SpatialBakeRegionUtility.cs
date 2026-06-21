@@ -15,12 +15,33 @@ namespace ZGConnect.SpatialStreaming.Editor
         static HashSet<string> _cachedSpatialBakedTileIds;
         static long _cachedSpatialManifestTimestamp;
 
+        static HashSet<string> _cachedSourceGlbTileIds;
+        static string _cachedSourceGlbFolder;
+        static long _cachedSourceGlbFolderTimestamp;
+
+        static List<string> _cachedResolveTileIds = new();
+        static int _cachedResolveMinE;
+        static int _cachedResolveMaxE;
+        static int _cachedResolveMinN;
+        static int _cachedResolveMaxN;
+        static string _cachedResolveSourceFolder;
+        static long _cachedResolveManifestTimestamp;
+        static long _cachedResolveSourceFolderTimestamp;
+        static int _cachedResolveTilesInRegion;
+        static int _cachedResolveTilesWithSourceGlb;
+        static bool _cachedResolveValid;
+
         public static void InvalidateMapCaches()
         {
             _cachedMapTiles = null;
             _cachedSpatialBakedTileIds = null;
             _cachedParentManifestTimestamp = 0;
             _cachedSpatialManifestTimestamp = 0;
+            _cachedSourceGlbTileIds = null;
+            _cachedSourceGlbFolder = null;
+            _cachedSourceGlbFolderTimestamp = 0;
+            _cachedResolveValid = false;
+            _cachedResolveTileIds.Clear();
         }
 
         public static bool TryLoadMapTiles(out List<HeightmapTileJson> tiles, out int tileSizeMeters, out string error)
@@ -157,23 +178,37 @@ namespace ZGConnect.SpatialStreaming.Editor
 
         public static HashSet<string> GetSourceGlbTileIds(string sourceFolder = null)
         {
-            var ids = new HashSet<string>();
             sourceFolder ??= SpatialStreamingPaths.BuildingMeshesSourceFolder;
             string folder = Path.Combine(SpatialStreamingPaths.DatasetRoot, sourceFolder);
-            if (!Directory.Exists(folder))
-                return ids;
+            long folderTimestamp = Directory.Exists(folder)
+                ? Directory.GetLastWriteTimeUtc(folder).Ticks
+                : 0;
 
-            foreach (string path in Directory.EnumerateFiles(folder, "*.glb", SearchOption.TopDirectoryOnly))
+            if (_cachedSourceGlbTileIds != null &&
+                sourceFolder == _cachedSourceGlbFolder &&
+                folderTimestamp == _cachedSourceGlbFolderTimestamp)
             {
-                string fileName = Path.GetFileNameWithoutExtension(path);
-                if (!fileName.StartsWith("buildings_"))
-                    continue;
-
-                string tileId = fileName.Substring("buildings_".Length);
-                if (!string.IsNullOrEmpty(tileId))
-                    ids.Add(tileId);
+                return _cachedSourceGlbTileIds;
             }
 
+            var ids = new HashSet<string>();
+            if (Directory.Exists(folder))
+            {
+                foreach (string path in Directory.EnumerateFiles(folder, "*.glb", SearchOption.TopDirectoryOnly))
+                {
+                    string fileName = Path.GetFileNameWithoutExtension(path);
+                    if (!fileName.StartsWith("buildings_"))
+                        continue;
+
+                    string tileId = fileName.Substring("buildings_".Length);
+                    if (!string.IsNullOrEmpty(tileId))
+                        ids.Add(tileId);
+                }
+            }
+
+            _cachedSourceGlbTileIds = ids;
+            _cachedSourceGlbFolder = sourceFolder;
+            _cachedSourceGlbFolderTimestamp = folderTimestamp;
             return ids;
         }
 
@@ -211,53 +246,131 @@ namespace ZGConnect.SpatialStreaming.Editor
         {
             tilesInRegion = 0;
             tilesWithSourceGlb = 0;
-            var result = new List<string>();
 
             if (maxE <= minE || maxN <= minN)
-                return result;
+                return new List<string>();
 
+            sourceFolder ??= SpatialStreamingPaths.BuildingMeshesSourceFolder;
             string manifestPath = SpatialStreamingPaths.ParentManifestPath();
-            if (!SpatialParentManifestReader.TryLoad(
-                    manifestPath,
-                    out int tileSizeMeters,
-                    out _,
-                    out List<SpatialParentTileInfo> parentTiles,
-                    out _))
+            long manifestTimestamp = File.Exists(manifestPath)
+                ? File.GetLastWriteTimeUtc(manifestPath).Ticks
+                : 0;
+            string sourcePath = Path.Combine(SpatialStreamingPaths.DatasetRoot, sourceFolder);
+            long sourceTimestamp = Directory.Exists(sourcePath)
+                ? Directory.GetLastWriteTimeUtc(sourcePath).Ticks
+                : 0;
+
+            if (TryGetCachedRegionResolve(
+                    minE,
+                    maxE,
+                    minN,
+                    maxN,
+                    sourceFolder,
+                    manifestTimestamp,
+                    sourceTimestamp,
+                    out tilesInRegion,
+                    out tilesWithSourceGlb,
+                    out List<string> cachedIds))
             {
-                return result;
+                return cachedIds;
             }
 
-            string datasetRoot = SpatialStreamingPaths.DatasetRoot;
-            sourceFolder ??= SpatialStreamingPaths.BuildingMeshesSourceFolder;
+            var result = new List<string>();
+            if (!TryLoadMapTiles(out List<HeightmapTileJson> tiles, out _, out _))
+                return result;
 
-            foreach (SpatialParentTileInfo tile in parentTiles)
+            HashSet<string> sourceGlbTileIds = GetSourceGlbTileIds(sourceFolder);
+            foreach (HeightmapTileJson tile in tiles)
             {
-                if (tile == null || string.IsNullOrEmpty(tile.TileId))
+                if (tile == null)
                     continue;
 
-                if (!SpatialTileIdUtility.TryParse(tile.TileId, out int left, out int bottom))
-                    continue;
-
-                int right = left + tileSizeMeters;
-                int top = bottom + tileSizeMeters;
-                if (left >= maxE || right <= minE || bottom >= maxN || top <= minN)
+                if (tile.Left >= maxE || tile.Right <= minE || tile.Bottom >= maxN || tile.Top <= minN)
                     continue;
 
                 tilesInRegion++;
-
-                string glbPath = Path.Combine(
-                    datasetRoot,
-                    sourceFolder,
-                    SpatialStreamingPaths.GetBuildingGlbFileName(tile.TileId));
-
-                if (!File.Exists(glbPath))
+                string tileId = $"{tile.Left}_{tile.Bottom}";
+                if (!sourceGlbTileIds.Contains(tileId))
                     continue;
 
                 tilesWithSourceGlb++;
-                result.Add(tile.TileId);
+                result.Add(tileId);
             }
 
-            return result;
+            StoreCachedRegionResolve(
+                minE,
+                maxE,
+                minN,
+                maxN,
+                sourceFolder,
+                manifestTimestamp,
+                sourceTimestamp,
+                tilesInRegion,
+                tilesWithSourceGlb,
+                result);
+
+            return new List<string>(result);
+        }
+
+        static bool TryGetCachedRegionResolve(
+            int minE,
+            int maxE,
+            int minN,
+            int maxN,
+            string sourceFolder,
+            long manifestTimestamp,
+            long sourceTimestamp,
+            out int tilesInRegion,
+            out int tilesWithSourceGlb,
+            out List<string> tileIds)
+        {
+            tilesInRegion = 0;
+            tilesWithSourceGlb = 0;
+            tileIds = null;
+
+            if (!_cachedResolveValid ||
+                minE != _cachedResolveMinE ||
+                maxE != _cachedResolveMaxE ||
+                minN != _cachedResolveMinN ||
+                maxN != _cachedResolveMaxN ||
+                sourceFolder != _cachedResolveSourceFolder ||
+                manifestTimestamp != _cachedResolveManifestTimestamp ||
+                sourceTimestamp != _cachedResolveSourceFolderTimestamp)
+            {
+                return false;
+            }
+
+            tilesInRegion = _cachedResolveTilesInRegion;
+            tilesWithSourceGlb = _cachedResolveTilesWithSourceGlb;
+            tileIds = new List<string>(_cachedResolveTileIds);
+            return true;
+        }
+
+        static void StoreCachedRegionResolve(
+            int minE,
+            int maxE,
+            int minN,
+            int maxN,
+            string sourceFolder,
+            long manifestTimestamp,
+            long sourceTimestamp,
+            int tilesInRegion,
+            int tilesWithSourceGlb,
+            List<string> tileIds)
+        {
+            _cachedResolveMinE = minE;
+            _cachedResolveMaxE = maxE;
+            _cachedResolveMinN = minN;
+            _cachedResolveMaxN = maxN;
+            _cachedResolveSourceFolder = sourceFolder;
+            _cachedResolveManifestTimestamp = manifestTimestamp;
+            _cachedResolveSourceFolderTimestamp = sourceTimestamp;
+            _cachedResolveTilesInRegion = tilesInRegion;
+            _cachedResolveTilesWithSourceGlb = tilesWithSourceGlb;
+            _cachedResolveTileIds.Clear();
+            if (tileIds != null)
+                _cachedResolveTileIds.AddRange(tileIds);
+            _cachedResolveValid = true;
         }
 
         public static int CountTilesInRegion(IReadOnlyList<HeightmapTileJson> tiles, int minE, int maxE, int minN, int maxN)

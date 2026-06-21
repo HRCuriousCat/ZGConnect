@@ -59,7 +59,7 @@ namespace ZGConnect.SpatialStreaming
 
         static int DeduplicateByShader(IEnumerable<MeshRenderer> renderers)
         {
-            var canonicalByShader = new Dictionary<int, Material>();
+            var canonicalByKey = new Dictionary<int, Material>();
             int changed = 0;
 
             foreach (MeshRenderer renderer in renderers)
@@ -75,13 +75,11 @@ namespace ZGConnect.SpatialStreaming
                     if (material == null || material.shader == null)
                         continue;
 
-                    int shaderId = material.shader != null
-                        ? material.shader.name.GetHashCode()
-                        : 0;
-                    if (!canonicalByShader.TryGetValue(shaderId, out Material canonical))
+                    int dedupKey = GetMaterialDedupKey(material);
+                    if (!canonicalByKey.TryGetValue(dedupKey, out Material canonical))
                     {
                         canonical = material;
-                        canonicalByShader.Add(shaderId, canonical);
+                        canonicalByKey.Add(dedupKey, canonical);
                     }
 
                     if (slots[i] == canonical)
@@ -99,6 +97,19 @@ namespace ZGConnect.SpatialStreaming
             }
 
             return changed;
+        }
+
+        static int GetMaterialDedupKey(Material material)
+        {
+            string normalized = BuildingSurfaceUtility.NormalizeMaterialName(material.name);
+            if (BuildingSurfaceUtility.TryResolveCategoryFromMaterialName(normalized, out _) &&
+                BuildingSurfaceUtility.TryResolveSurfaceTypeFromMaterialName(normalized, out _))
+            {
+                // Keep facade vs roof (and variant picks) separate even when shaders match.
+                return normalized.GetHashCode();
+            }
+
+            return material.shader.name.GetHashCode();
         }
 
         public static int CountUniqueMaterials(IEnumerable<MeshRenderer> renderers)

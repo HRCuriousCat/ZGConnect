@@ -37,13 +37,17 @@ namespace ZGConnect.SpatialStreaming.Editor
         bool _bakeRunning;
         bool _rebuildManifestFromStaging = true;
         string _bakeStatus = "Idle";
-        float _bakeProgress;
+        readonly SpatialBakeProgressTracker _bakeProgressTracker = new();
         SpatialBakePipeline.BakeReport _bakeReport;
 
         SpatialStreamingSourceScanResult _scan;
         Vector2 _scroll;
         IEnumerator _bakeRoutine;
         int _cachedTileSizeMeters = 1000;
+        int _regionTilesInRegion;
+        int _regionTilesWithSourceGlb;
+        List<string> _regionBakeTileIds = new();
+        bool _regionPreviewValid;
 
         [MenuItem("ZG Connect/Spatial Streaming")]
         public static void Open()
@@ -74,7 +78,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             SaveBakeProfileToPrefs();
             SaveRegionSettings();
             StopBakeRoutine();
-            if (ZGConnectImportRegionBridge.RepaintImporter == (Action)Repaint)
+            if (ZGConnectImportRegionBridge.ApplyTargetLabel == "Spatial Streaming")
                 ZGConnectImportRegionBridge.Clear();
         }
 
@@ -150,8 +154,14 @@ namespace ZGConnect.SpatialStreaming.Editor
         {
             EditorGUILayout.LabelField("Spatial bake → bundles_spatial/", EditorStyles.boldLabel);
 
+            EditorGUI.BeginChangeCheck();
             _bakeProfile = (SpatialBakeProfile)EditorGUILayout.ObjectField(
                 "Bake profile", _bakeProfile, typeof(SpatialBakeProfile), false);
+            if (EditorGUI.EndChangeCheck())
+            {
+                SaveBakeProfileToPrefs();
+                InvalidateRegionPreview();
+            }
 
             if (_bakeProfile == null)
             {
@@ -163,6 +173,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             }
             else
             {
+                EditorGUI.BeginChangeCheck();
                 EditorGUILayout.LabelField("Source", SpatialStreamingPaths.BuildingMeshesSourceFolder);
                 EditorGUILayout.LabelField("Subcell size (m)", _bakeProfile.subcellSizeMeters.ToString());
                 EditorGUILayout.LabelField("Split threshold (buildings)", _bakeProfile.minBuildingsForSubcellSplit.ToString());
@@ -171,6 +182,9 @@ namespace ZGConnect.SpatialStreaming.Editor
                     _bakeProfile.buildingSurfaceSettings,
                     typeof(BuildingSurfaceSettings),
                     false);
+                if (EditorGUI.EndChangeCheck())
+                    InvalidateRegionPreview();
+
                 if (_bakeProfile.buildingSurfaceSettings == null)
                 {
                     EditorGUILayout.HelpBox(
@@ -178,24 +192,21 @@ namespace ZGConnect.SpatialStreaming.Editor
                         MessageType.Warning);
                 }
 
+                EditorGUI.BeginChangeCheck();
                 _bakeProfile.verboseBakeLogging = EditorGUILayout.Toggle(
                     "Verbose bake logging", _bakeProfile.verboseBakeLogging);
+                if (EditorGUI.EndChangeCheck())
+                    SaveBakeProfileToPrefs();
 
                 EditorGUILayout.Space(4f);
+                EnsureRegionPreview();
                 DrawBakeScopeSection();
             }
 
             if (_bakeRunning)
-            {
-                EditorGUI.ProgressBar(
-                    EditorGUILayout.GetControlRect(false, 20f),
-                    _bakeProgress,
-                    _bakeStatus);
-            }
+                DrawBakeProgressContent();
             else
-            {
                 EditorGUILayout.LabelField("Status", _bakeStatus);
-            }
 
             using (new EditorGUI.DisabledScope(_bakeRunning || _bakeProfile == null || !CanStartBake()))
             {
@@ -207,6 +218,39 @@ namespace ZGConnect.SpatialStreaming.Editor
                 StopBakeRoutine();
 
             DrawStagingRecoverySection();
+            DrawManifestRecoverySection();
+        }
+
+        void DrawManifestRecoverySection()
+        {
+            if (_scan == null || !_scan.SpatialManifestExists || _scan.SpatialBundleFileCount <= 0)
+                return;
+
+            bool showSync = false;
+            foreach (string warning in _scan.Warnings)
+            {
+                if (warning.Contains("Sync manifest to bundles on disk", StringComparison.Ordinal))
+                {
+                    showSync = true;
+                    break;
+                }
+            }
+
+            if (!showSync)
+                return;
+
+            EditorGUILayout.Space(8f);
+            EditorGUILayout.LabelField("Manifest recovery", EditorStyles.boldLabel);
+            EditorGUILayout.HelpBox(
+                "spatial_manifest.json references tiles whose bundles are missing on disk. " +
+                "Sync trims the manifest to match bundles_spatial/ (does not rebuild bundles).",
+                MessageType.Warning);
+
+            using (new EditorGUI.DisabledScope(_bakeRunning || _bakeProfile == null))
+            {
+                if (GUILayout.Button("Sync manifest to bundles on disk"))
+                    SyncManifestFromBundlesOnDisk();
+            }
         }
 
         void DrawStagingRecoverySection()
@@ -313,6 +357,44 @@ namespace ZGConnect.SpatialStreaming.Editor
                 CreateDefaultSettingsAsset();
         }
 
+        void DrawBakeProgressContent()
+        {
+            if (!_bakeProgressTracker.HasStarted)
+            {
+                EditorGUILayout.LabelField("Status", _bakeStatus);
+                return;
+            }
+
+            Rect masterRect = GUILayoutUtility.GetRect(22f, 24f, GUILayout.ExpandWidth(true));
+            EditorGUI.ProgressBar(
+                masterRect,
+                _bakeProgressTracker.Master,
+                $"Overall  {_bakeProgressTracker.Master * 100f:0}%");
+
+            if (!string.IsNullOrEmpty(_bakeProgressTracker.StatusDetail))
+                EditorGUILayout.LabelField(_bakeProgressTracker.StatusDetail, EditorStyles.miniLabel);
+
+            EditorGUILayout.Space(4f);
+            foreach (SpatialBakeProgressTracker.StageSlot stage in _bakeProgressTracker.Stages)
+                DrawBakeStageProgressBar(stage);
+        }
+
+        static void DrawBakeStageProgressBar(SpatialBakeProgressTracker.StageSlot stage)
+        {
+            if (!stage.Enabled)
+                return;
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField(stage.Label, GUILayout.Width(118f));
+            Rect barRect = GUILayoutUtility.GetRect(14f, 16f, GUILayout.ExpandWidth(true));
+            string barText = !string.IsNullOrEmpty(stage.Detail)
+                ? stage.Detail
+                : $"{stage.Progress * 100f:0}%";
+            EditorGUI.ProgressBar(barRect, stage.Progress, barText);
+            EditorGUILayout.EndHorizontal();
+            EditorGUILayout.Space(2f);
+        }
+
         void DrawBakeScopeSection()
         {
             EditorGUILayout.LabelField("Bake scope", EditorStyles.boldLabel);
@@ -320,7 +402,10 @@ namespace ZGConnect.SpatialStreaming.Editor
             EditorGUI.BeginChangeCheck();
             _bakeTileMode = (SpatialBakeTileMode)EditorGUILayout.EnumPopup("Tiles to bake", _bakeTileMode);
             if (EditorGUI.EndChangeCheck())
+            {
                 SaveRegionSettings();
+                InvalidateRegionPreview();
+            }
 
             if (_bakeTileMode == SpatialBakeTileMode.All)
             {
@@ -343,6 +428,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             {
                 AlignRegionToHlodGrid();
                 SaveRegionSettings();
+                InvalidateRegionPreview();
             }
 
             EditorGUILayout.HelpBox(
@@ -360,30 +446,21 @@ namespace ZGConnect.SpatialStreaming.Editor
 
             if (_regionMaxE > _regionMinE && _regionMaxN > _regionMinN)
             {
-                List<string> bakeIds = SpatialBakeRegionUtility.ResolveBakeTileIdsInRegion(
-                    _regionMinE,
-                    _regionMaxE,
-                    _regionMinN,
-                    _regionMaxN,
-                    _bakeProfile?.GetSourceFolder(),
-                    out int tilesInRegion,
-                    out int tilesWithSourceGlb);
-
                 EditorGUILayout.LabelField(
-                    $"Region: {tilesWithSourceGlb} tile(s) with source GLBs " +
-                    $"({tilesInRegion} manifest tile(s) intersect region)",
+                    $"Region: {_regionTilesWithSourceGlb} tile(s) with source GLBs " +
+                    $"({_regionTilesInRegion} manifest tile(s) intersect region)",
                     EditorStyles.miniLabel);
 
-                if (tilesWithSourceGlb == 0)
+                if (_regionTilesWithSourceGlb == 0)
                 {
                     EditorGUILayout.HelpBox(
                         "No source building GLBs intersect the current region. " +
                         "Drag a rectangle on the map or adjust EPSG bounds.",
                         MessageType.Warning);
                 }
-                else if (bakeIds.Count <= 12)
+                else if (_regionBakeTileIds.Count <= 12)
                 {
-                    EditorGUILayout.LabelField(string.Join(", ", bakeIds), EditorStyles.wordWrappedMiniLabel);
+                    EditorGUILayout.LabelField(string.Join(", ", _regionBakeTileIds), EditorStyles.wordWrappedMiniLabel);
                 }
             }
             else
@@ -402,17 +479,9 @@ namespace ZGConnect.SpatialStreaming.Editor
             if (_regionMaxE <= _regionMinE || _regionMaxN <= _regionMinN)
                 return "Bake Selected Region";
 
-            SpatialBakeRegionUtility.ResolveBakeTileIdsInRegion(
-                _regionMinE,
-                _regionMaxE,
-                _regionMinN,
-                _regionMaxN,
-                _bakeProfile?.GetSourceFolder(),
-                out _,
-                out int tilesWithSourceGlb);
-
-            return tilesWithSourceGlb > 0
-                ? $"Bake Selected Region ({tilesWithSourceGlb} tiles)"
+            EnsureRegionPreview();
+            return _regionTilesWithSourceGlb > 0
+                ? $"Bake Selected Region ({_regionTilesWithSourceGlb} tiles)"
                 : "Bake Selected Region";
         }
 
@@ -424,16 +493,41 @@ namespace ZGConnect.SpatialStreaming.Editor
             if (_regionMaxE <= _regionMinE || _regionMaxN <= _regionMinN)
                 return false;
 
-            SpatialBakeRegionUtility.ResolveBakeTileIdsInRegion(
+            EnsureRegionPreview();
+            return _regionTilesWithSourceGlb > 0;
+        }
+
+        void InvalidateRegionPreview() => _regionPreviewValid = false;
+
+        void EnsureRegionPreview()
+        {
+            if (_bakeTileMode != SpatialBakeTileMode.Region)
+            {
+                _regionPreviewValid = false;
+                return;
+            }
+
+            if (_regionPreviewValid)
+                return;
+
+            if (_regionMaxE <= _regionMinE || _regionMaxN <= _regionMinN)
+            {
+                _regionTilesInRegion = 0;
+                _regionTilesWithSourceGlb = 0;
+                _regionBakeTileIds.Clear();
+                _regionPreviewValid = true;
+                return;
+            }
+
+            _regionBakeTileIds = SpatialBakeRegionUtility.ResolveBakeTileIdsInRegion(
                 _regionMinE,
                 _regionMaxE,
                 _regionMinN,
                 _regionMaxN,
                 _bakeProfile?.GetSourceFolder(),
-                out _,
-                out int tilesWithSourceGlb);
-
-            return tilesWithSourceGlb > 0;
+                out _regionTilesInRegion,
+                out _regionTilesWithSourceGlb);
+            _regionPreviewValid = true;
         }
 
         void RegisterRegionBridge()
@@ -480,9 +574,14 @@ namespace ZGConnect.SpatialStreaming.Editor
                 _bakeTileMode = SpatialBakeTileMode.Region;
                 AlignRegionToHlodGrid();
                 SaveRegionSettings();
+                InvalidateRegionPreview();
                 Repaint();
             };
-            ZGConnectImportRegionBridge.RepaintImporter = Repaint;
+            ZGConnectImportRegionBridge.RepaintImporter = () =>
+            {
+                InvalidateRegionPreview();
+                Repaint();
+            };
             ZGConnectImportRegionBridge.GetPackedTileIds = SpatialBakeRegionUtility.GetSpatialBakedTileIds;
         }
 
@@ -560,16 +659,10 @@ namespace ZGConnect.SpatialStreaming.Editor
             IReadOnlyList<string> runtimeTileFilter = null;
             if (_bakeTileMode == SpatialBakeTileMode.Region)
             {
-                runtimeTileFilter = SpatialBakeRegionUtility.ResolveBakeTileIdsInRegion(
-                    _regionMinE,
-                    _regionMaxE,
-                    _regionMinN,
-                    _regionMaxN,
-                    _bakeProfile.GetSourceFolder(),
-                    out _,
-                    out int tilesWithSourceGlb);
+                EnsureRegionPreview();
+                runtimeTileFilter = _regionBakeTileIds;
 
-                if (tilesWithSourceGlb == 0)
+                if (_regionTilesWithSourceGlb == 0)
                 {
                     EditorUtility.DisplayDialog(
                         "Spatial Streaming",
@@ -580,22 +673,56 @@ namespace ZGConnect.SpatialStreaming.Editor
             }
 
             _bakeRunning = true;
-            _bakeProgress = 0f;
             _bakeStatus = "Starting bake...";
+            _bakeProgressTracker.Clear();
 
             _bakeReport = new SpatialBakePipeline.BakeReport();
             _bakeRoutine = SpatialBakePipeline.BakeCoroutine(
                 _bakeProfile,
-                (progress, detail) =>
-                {
-                    _bakeProgress = progress;
-                    _bakeStatus = detail ?? "Baking...";
-                    Repaint();
-                },
+                _bakeProgressTracker,
+                _ => Repaint(),
                 _bakeReport,
                 runtimeTileFilter);
 
             EditorApplication.update += BakeEditorUpdate;
+        }
+
+        void SyncManifestFromBundlesOnDisk()
+        {
+            if (_bakeProfile == null)
+            {
+                EditorUtility.DisplayDialog("Spatial Streaming", "Assign a bake profile first.", "OK");
+                return;
+            }
+
+            if (!EditorUtility.DisplayDialog(
+                    "Sync spatial manifest",
+                    "Rebuild spatial_manifest.json from bundles_spatial/ on disk? " +
+                    "Tiles without bundle folders will be removed from the manifest.",
+                    "Sync",
+                    "Cancel"))
+            {
+                return;
+            }
+
+            try
+            {
+                SpatialDatasetManifest manifest =
+                    SpatialStagingBundleUtility.RebuildManifestFromBundlesOnDisk(_bakeProfile);
+                string manifestPath = SpatialStreamingPaths.SpatialManifestPath();
+                manifest.SaveToFile(manifestPath);
+                SpatialBakeRegionUtility.InvalidateMapCaches();
+                AssetDatabase.Refresh();
+                RefreshSourceScan();
+                EditorUtility.DisplayDialog(
+                    "Spatial Streaming",
+                    $"Updated spatial_manifest.json with {manifest.Tiles?.Count ?? 0} tile(s).",
+                    "OK");
+            }
+            catch (Exception ex)
+            {
+                EditorUtility.DisplayDialog("Spatial Streaming", ex.Message, "OK");
+            }
         }
 
         void StartBuildFromStaging()
@@ -607,19 +734,15 @@ namespace ZGConnect.SpatialStreaming.Editor
             }
 
             _bakeRunning = true;
-            _bakeProgress = 0f;
             _bakeStatus = "Building bundles from staging...";
+            _bakeProgressTracker.Clear();
 
             _bakeReport = new SpatialBakePipeline.BakeReport();
             _bakeRoutine = SpatialBakePipeline.BuildBundlesFromStagingCoroutine(
                 _bakeProfile,
                 _rebuildManifestFromStaging,
-                (progress, detail) =>
-                {
-                    _bakeProgress = progress;
-                    _bakeStatus = detail ?? "Building bundles...";
-                    Repaint();
-                },
+                _bakeProgressTracker,
+                _ => Repaint(),
                 _bakeReport);
 
             EditorApplication.update += BakeEditorUpdate;
@@ -631,6 +754,15 @@ namespace ZGConnect.SpatialStreaming.Editor
             {
                 StopBakeRoutine();
                 return;
+            }
+
+            if (_bakeRunning && _bakeProgressTracker.HasStarted)
+            {
+                string detail = _bakeProgressTracker.StatusDetail ?? _bakeStatus;
+                EditorUtility.DisplayProgressBar(
+                    "Spatial Streaming Bake",
+                    detail,
+                    _bakeProgressTracker.Master);
             }
 
             try
@@ -652,7 +784,6 @@ namespace ZGConnect.SpatialStreaming.Editor
             _bakeStatus = !string.IsNullOrEmpty(_bakeReport?.Message)
                 ? _bakeReport.Message
                 : "Bake finished.";
-            _bakeProgress = 1f;
             if (!string.IsNullOrEmpty(_bakeReport?.Message))
                 Debug.Log($"[ZGConnect.Spatial] {_bakeReport.Message}");
             StopBakeRoutine();
@@ -665,6 +796,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             _bakeRunning = false;
             _bakeRoutine = null;
             EditorApplication.update -= BakeEditorUpdate;
+            EditorUtility.ClearProgressBar();
         }
 
         void ApplyProjectSettings()
@@ -698,6 +830,7 @@ namespace ZGConnect.SpatialStreaming.Editor
             _scan = SpatialStreamingSourceScanner.Scan();
             if (SpatialBakeRegionUtility.TryLoadMapTiles(out _, out int tileSizeMeters, out _))
                 _cachedTileSizeMeters = tileSizeMeters;
+            InvalidateRegionPreview();
             RegisterRegionBridge();
             Repaint();
         }

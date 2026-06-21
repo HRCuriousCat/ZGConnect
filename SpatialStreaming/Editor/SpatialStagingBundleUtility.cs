@@ -1,6 +1,8 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
@@ -74,6 +76,13 @@ namespace ZGConnect.SpatialStreaming.Editor
                 string suffix = fileName.Substring(prefix.Length);
                 if (string.IsNullOrEmpty(suffix))
                     continue;
+
+                if (!suffix.EndsWith("_proxy", StringComparison.Ordinal))
+                {
+                    string detailAssetPath = $"{tileFolder}/Spatial_{tileId}_{suffix}_Detail.asset";
+                    if (AssetDatabase.LoadAssetAtPath<SpatialMeshDetailAsset>(detailAssetPath) != null)
+                        continue;
+                }
 
                 string assetPath = $"{tileFolder}/{Path.GetFileName(prefabFull)}";
                 if (AssetDatabase.LoadAssetAtPath<GameObject>(assetPath) == null)
@@ -155,18 +164,24 @@ namespace ZGConnect.SpatialStreaming.Editor
             }
         }
 
-        public static bool BuildAndCopyBundlesBatched(
+        public sealed class SpatialBundleBatchResult
+        {
+            public string Error;
+            public bool Succeeded => string.IsNullOrEmpty(Error);
+        }
+
+        public static IEnumerator BuildAndCopyBundlesBatchedCoroutine(
             SpatialBakeProfile profile,
             List<AssetBundleBuild> builds,
             Action<float, string> onProgress,
-            out string error,
+            SpatialBundleBatchResult result,
             int batchSize = DefaultBatchSize)
         {
-            error = null;
+            result.Error = null;
             if (builds == null || builds.Count == 0)
             {
-                error = "No bundles to build.";
-                return false;
+                result.Error = "No bundles to build.";
+                yield break;
             }
 
             if (batchSize < 1)
@@ -202,6 +217,8 @@ namespace ZGConnect.SpatialStreaming.Editor
                     (float)copied / total,
                     $"Building bundle batch {batchIndex} ({copied}/{total})...");
 
+                yield return null;
+
                 bool ok = BuildPipeline.BuildAssetBundles(
                     stagingOutput,
                     batch.ToArray(),
@@ -210,12 +227,12 @@ namespace ZGConnect.SpatialStreaming.Editor
 
                 if (!ok)
                 {
-                    error =
+                    result.Error =
                         $"BuildPipeline.BuildAssetBundles failed on batch {batchIndex} " +
                         $"(bundles {offset + 1}-{offset + count} of {total}). " +
                         "Staged prefabs were kept — try 'Build bundles from staging'.";
-                    SpatialBakeVerboseLog.Global("asset-bundles-batch-failed", error);
-                    return false;
+                    SpatialBakeVerboseLog.Global("asset-bundles-batch-failed", result.Error);
+                    yield break;
                 }
 
                 foreach (AssetBundleBuild build in batch)
@@ -223,9 +240,9 @@ namespace ZGConnect.SpatialStreaming.Editor
                     string src = Path.Combine(stagingFull, build.assetBundleName);
                     if (!File.Exists(src))
                     {
-                        error = $"Built bundle missing: {src} (batch {batchIndex}).";
-                        SpatialBakeVerboseLog.Global("asset-bundles-missing-file", error);
-                        return false;
+                        result.Error = $"Built bundle missing: {src} (batch {batchIndex}).";
+                        SpatialBakeVerboseLog.Global("asset-bundles-missing-file", result.Error);
+                        yield break;
                     }
 
                     string dest = Path.Combine(spatialOutputRoot, build.assetBundleName);
@@ -238,17 +255,21 @@ namespace ZGConnect.SpatialStreaming.Editor
 
                     TryDeleteFile(src);
                     TryDeleteFile(src + ".manifest");
+
+                    if (copied % 4 == 0)
+                        yield return null;
                 }
 
                 TryDeleteFile(Path.Combine(stagingFull, "bundles"));
                 TryDeleteFile(Path.Combine(stagingFull, "bundles.manifest"));
+
+                yield return null;
             }
 
             SpatialBakeVerboseLog.Global(
                 "asset-bundles-batched-done",
                 $"copied={copied} output={spatialOutputRoot}");
             onProgress?.Invoke(1f, $"Copied {copied} bundle(s).");
-            return true;
         }
 
         public static SpatialDatasetManifest RebuildManifestFromStaging(
@@ -348,6 +369,10 @@ namespace ZGConnect.SpatialStreaming.Editor
                     }
 
                     if (!TryParseSubcellId(suffix, out int gridX, out int gridY))
+                        continue;
+
+                    string detailAssetPath = $"{tileFolder}/Spatial_{tileId}_{suffix}_Detail.asset";
+                    if (AssetDatabase.LoadAssetAtPath<SpatialMeshDetailAsset>(detailAssetPath) != null)
                         continue;
 
                     tileEntry.Subcells.Add(new SpatialSubcellManifestEntry
@@ -530,6 +555,248 @@ namespace ZGConnect.SpatialStreaming.Editor
             {
                 SpatialBakeVerboseLog.Global("staging-cleanup-warn", $"{path}: {ex.Message}");
             }
+        }
+
+        public static bool TileEntryHasBundleOnDisk(SpatialTileManifestEntry tile)
+        {
+            if (tile == null)
+                return false;
+
+            if (tile.UsesSubcells && tile.Subcells != null && tile.Subcells.Count > 0)
+            {
+                foreach (SpatialSubcellManifestEntry subcell in tile.Subcells)
+                {
+                    if (subcell != null && BundleFileExists(subcell.BundleRel))
+                        return true;
+                }
+
+                return false;
+            }
+
+            if (!string.IsNullOrEmpty(tile.CoarseBundleRel) && BundleFileExists(tile.CoarseBundleRel))
+                return true;
+
+            return false;
+        }
+
+        public static SpatialDatasetManifest RebuildManifestFromBundlesOnDisk(
+            SpatialBakeProfile profile,
+            string stagingAssetRoot = null)
+        {
+            stagingAssetRoot ??= SpatialStreamingPaths.SpatialStagingAssetRoot;
+
+            if (!SpatialParentManifestReader.TryLoad(
+                    SpatialStreamingPaths.ParentManifestPath(),
+                    out int tileSizeMeters,
+                    out _,
+                    out List<SpatialParentTileInfo> parentTiles,
+                    out string parentError))
+            {
+                throw new InvalidOperationException(parentError);
+            }
+
+            var parentById = new Dictionary<string, SpatialParentTileInfo>(StringComparer.Ordinal);
+            foreach (SpatialParentTileInfo tile in parentTiles)
+            {
+                if (tile != null && !string.IsNullOrEmpty(tile.TileId))
+                    parentById[tile.TileId] = tile;
+            }
+
+            var manifest = new SpatialDatasetManifest
+            {
+                Version = "1",
+                SourceManifest = SpatialStreamingPaths.DefaultParentManifestRelativePath,
+                BakeFingerprint = profile != null ? profile.ComputeFingerprintString() : "bundle-sync",
+                TileSizeMeters = tileSizeMeters,
+                SubcellSizeMeters = profile?.subcellSizeMeters ?? 250,
+            };
+
+            string bundlesRoot = SpatialStreamingPaths.SpatialBundlesRoot;
+            if (!Directory.Exists(bundlesRoot))
+                return manifest;
+
+            foreach (string tileDir in Directory.GetDirectories(bundlesRoot))
+            {
+                string tileId = Path.GetFileName(tileDir);
+                if (string.IsNullOrEmpty(tileId) ||
+                    tileId.StartsWith("hlod", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (!Directory.EnumerateFiles(tileDir).Any(path =>
+                        !path.EndsWith(".meta", StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                if (!parentById.TryGetValue(tileId, out SpatialParentTileInfo parentTile))
+                {
+                    SpatialBakeVerboseLog.TileWarning(tileId, "manifest-skip", "tile not in parent manifest");
+                    continue;
+                }
+
+                var tileEntry = new SpatialTileManifestEntry
+                {
+                    TileId = tileId,
+                    UnityPosition = new[]
+                    {
+                        parentTile.UnityPosition.x,
+                        parentTile.UnityPosition.y,
+                        parentTile.UnityPosition.z,
+                    },
+                };
+
+                foreach (string bundleFull in Directory.GetFiles(tileDir))
+                {
+                    if (bundleFull.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string suffix = Path.GetFileName(bundleFull);
+                    ApplyBundleSuffixToTileEntry(
+                        tileEntry,
+                        tileId,
+                        suffix,
+                        stagingAssetRoot,
+                        profile);
+                }
+
+                if (tileEntry.UsesSubcells || !string.IsNullOrEmpty(tileEntry.CoarseBundleRel))
+                    manifest.Tiles.Add(tileEntry);
+            }
+
+            RebuildSupertileManifestEntriesFromBundles(manifest, tileSizeMeters);
+            return manifest;
+        }
+
+        static void ApplyBundleSuffixToTileEntry(
+            SpatialTileManifestEntry tileEntry,
+            string tileId,
+            string suffix,
+            string stagingAssetRoot,
+            SpatialBakeProfile profile)
+        {
+            if (tileEntry == null || string.IsNullOrEmpty(suffix))
+                return;
+
+            if (suffix == "tile_coarse")
+            {
+                tileEntry.CoarseBundleRel = SpatialStreamingPaths.GetTileCoarseBundleRelativePath(tileId);
+                return;
+            }
+
+            if (suffix == "tile_proxy")
+            {
+                tileEntry.ProxyBundleRel = SpatialStreamingPaths.GetTileProxyBundleRelativePath(tileId);
+                return;
+            }
+
+            if (suffix.EndsWith("_proxy", StringComparison.Ordinal))
+            {
+                string subcellId = suffix.Substring(0, suffix.Length - "_proxy".Length);
+                if (!TryParseSubcellId(subcellId, out int proxyGridX, out int proxyGridY))
+                    return;
+
+                SpatialSubcellManifestEntry proxySubcell =
+                    FindOrAddSubcell(tileEntry, subcellId, proxyGridX, proxyGridY);
+                proxySubcell.ProxyBundleRel =
+                    SpatialStreamingPaths.GetSubcellProxyBundleRelativePath(tileId, subcellId);
+                return;
+            }
+
+            if (!TryParseSubcellId(suffix, out int gridX, out int gridY))
+                return;
+
+            SpatialSubcellManifestEntry subcell = FindOrAddSubcell(tileEntry, suffix, gridX, gridY);
+            subcell.BundleRel = SpatialStreamingPaths.GetSubcellBundleRelativePath(tileId, suffix);
+
+            string detailAssetPath = $"{stagingAssetRoot}/{tileId}/Spatial_{tileId}_{suffix}_Detail.asset";
+            if (profile?.detailBundleMode == SpatialDetailBundleMode.MeshAssets &&
+                AssetDatabase.LoadAssetAtPath<SpatialMeshDetailAsset>(detailAssetPath) != null)
+            {
+                subcell.LoadKind = SpatialSubcellManifestEntry.MeshDetailLoadKind;
+                SpatialMeshDetailAsset detailAsset =
+                    AssetDatabase.LoadAssetAtPath<SpatialMeshDetailAsset>(detailAssetPath);
+                subcell.BuildingCount = detailAsset?.Renderers != null ? detailAsset.Renderers.Length : 0;
+            }
+        }
+
+        static void RebuildSupertileManifestEntriesFromBundles(
+            SpatialDatasetManifest manifest,
+            int tileSizeMeters)
+        {
+            manifest.Supertiles ??= new List<SpatialSupertileManifestEntry>();
+            string bundlesRoot = SpatialStreamingPaths.SpatialBundlesRoot;
+
+            foreach (int factor in new[] { 2, 4 })
+            {
+                string hlodFolder = Path.Combine(bundlesRoot, $"hlod{factor}");
+                if (!Directory.Exists(hlodFolder))
+                    continue;
+
+                int blockSizeMeters = tileSizeMeters * factor;
+                foreach (string bundleFull in Directory.GetFiles(hlodFolder))
+                {
+                    if (bundleFull.EndsWith(".meta", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string fileName = Path.GetFileName(bundleFull);
+                    string[] parts = fileName.Split('_');
+                    if (parts.Length != 2 ||
+                        !int.TryParse(parts[0], out int left) ||
+                        !int.TryParse(parts[1], out int bottom))
+                    {
+                        continue;
+                    }
+
+                    string supertileId = SpatialStreamingPaths.GetSupertileId(factor, left, bottom);
+                    var childTileIds = new List<string>();
+                    var origin = new Vector3(float.MaxValue, 0f, float.MaxValue);
+
+                    foreach (SpatialTileManifestEntry tile in manifest.Tiles)
+                    {
+                        if (tile == null ||
+                            !SpatialTileIdUtility.TryParse(tile.TileId, out int tileLeft, out int tileBottom))
+                        {
+                            continue;
+                        }
+
+                        if (tileLeft < left || tileLeft >= left + blockSizeMeters ||
+                            tileBottom < bottom || tileBottom >= bottom + blockSizeMeters)
+                        {
+                            continue;
+                        }
+
+                        childTileIds.Add(tile.TileId);
+                        Vector3 pos = tile.GetUnityPosition();
+                        origin.x = Mathf.Min(origin.x, pos.x);
+                        origin.z = Mathf.Min(origin.z, pos.z);
+                    }
+
+                    if (childTileIds.Count == 0)
+                        continue;
+
+                    manifest.Supertiles.Add(new SpatialSupertileManifestEntry
+                    {
+                        SupertileId = supertileId,
+                        Factor = factor,
+                        Left = left,
+                        Bottom = bottom,
+                        UnityPosition = new[] { origin.x, origin.y, origin.z },
+                        BundleRel = SpatialStreamingPaths.GetSupertileBundleRelativePath(factor, left, bottom),
+                        ChildTileIds = childTileIds,
+                    });
+                }
+            }
+        }
+
+        static bool BundleFileExists(string bundleRel)
+        {
+            if (string.IsNullOrEmpty(bundleRel))
+                return false;
+
+            return SpatialStreamingPaths.FileExists(
+                SpatialStreamingPaths.ResolveDatasetRelativePath(bundleRel));
         }
     }
 }

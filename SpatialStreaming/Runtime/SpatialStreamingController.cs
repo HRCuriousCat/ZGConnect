@@ -4,12 +4,12 @@ using System.IO;
 using System.Linq;
 using UnityEngine;
 using UnityEngine.Profiling;
-using UnityEngine.Serialization;
 using ZGConnect;
 
 namespace ZGConnect.SpatialStreaming
 {
     [DisallowMultipleComponent]
+    [RequireComponent(typeof(SpatialStreamingDetailCrossfade))]
     public sealed class SpatialStreamingController : MonoBehaviour
     {
         [Header("Dataset")]
@@ -20,31 +20,24 @@ namespace ZGConnect.SpatialStreaming
         [Header("HLOD")]
         [SerializeField] bool _enableHlod = true;
 
-        [Header("Detail spawn (whole tile triggers all subcells)")]
-        [Tooltip("When the camera is within this distance of a subcell edge, that subcell's proxy/detail begin loading.")]
-        [FormerlySerializedAs("_loadDistanceMeters")]
-        [FormerlySerializedAs("_detailLoadDistanceMeters")]
-        [SerializeField] float _detailTileLoadDistanceMeters = 1200f;
-        [Tooltip("When the camera exceeds this distance from the tile, all detail subcells for that tile unload.")]
-        [FormerlySerializedAs("_unloadDistanceMeters")]
-        [FormerlySerializedAs("_detailUnloadDistanceMeters")]
-        [SerializeField] float _detailTileUnloadDistanceMeters = 1600f;
-
-        [Header("Tile proxy")]
-        [SerializeField] float _proxyLoadDistanceMeters = 2800f;
-        [SerializeField] float _proxyUnloadDistanceMeters = 3200f;
-
-        [Header("HLOD supertiles")]
-        [SerializeField] float _hlod2LoadDistanceMeters = 5000f;
-        [SerializeField] float _hlod2UnloadDistanceMeters = 6000f;
-        [SerializeField] float _hlod4LoadDistanceMeters = 15000f;
-        [SerializeField] float _hlod4UnloadDistanceMeters = 17000f;
+        [Header("LOD tile rings")]
+        [Tooltip("Square of 1 km tiles with full detail. 1 = camera tile only, 2 = 3×3. 0 = skip.")]
+        [SerializeField] int _detailRings = 2;
+        [Tooltip("Exclusive tile rings outside detail — sub-cell footprint proxies. 0 = skip.")]
+        [SerializeField] int _subcellProxyRings = 2;
+        [Tooltip("Exclusive tile rings outside sub-cell proxy band — full tile proxies. 0 = skip.")]
+        [SerializeField] int _tileProxyRings = 2;
+        [Tooltip("Cumulative 1 km tile rings through HLOD2 (after tile-proxy band). 0 = skip.")]
+        [SerializeField] int _hlod2x2Rings = 3;
+        [Tooltip("Cumulative 1 km tile rings through HLOD4 (after HLOD2 band). 0 = skip.")]
+        [SerializeField] int _hlod4x4Rings = 5;
 
         [Header("Streaming")]
+        [Tooltip("How often to re-evaluate HLOD want/unload from camera distance. Does not throttle loading or instantiation.")]
         [SerializeField] float _checkInterval = 0.35f;
         [SerializeField] SpatialStreamingLoadBudget _loadBudget = SpatialStreamingLoadBudget.Default;
 
-        SpatialStreamingHlodDistances _hlodDistances;
+        SpatialStreamingTileRings _tileRings;
 
         [Header("Rendering")]
         [SerializeField] SpatialGpuResidentRenderingSettings _gpuSettings;
@@ -55,6 +48,11 @@ namespace ZGConnect.SpatialStreaming
         [Header("Debug")]
         [SerializeField] bool _showDebugHud = true;
         [SerializeField] bool _logStreaming;
+        [Tooltip("Tint each streamed block by LOD level (detail=green, subcell proxy=cyan, tile proxy=yellow, HLOD2=orange, HLOD4=red).")]
+        [SerializeField] bool _debugLodTint;
+        [Tooltip("Uniform scale of the runtime debug HUD panel.")]
+        [Range(0.25f, 2.5f)]
+        [SerializeField] float _debugHudScale = 1f;
 
         [Header("Performance profiling")]
         [SerializeField] bool _enablePerformanceProfiling = true;
@@ -63,7 +61,30 @@ namespace ZGConnect.SpatialStreaming
         [SerializeField] bool _logSpikesToCsv = true;
         [SerializeField] bool _logSpikesToConsole;
 
+        [Header("Advanced LOD (optional)")]
+        [Tooltip("Sort pending loads by projected screen size instead of raw distance.")]
+        [SerializeField] bool _useScreenSpaceLodPriority;
+        [SerializeField] float _screenSpaceFovDegrees = 60f;
+        [Tooltip("Spread ring-window evaluate across frames when the active window is large.")]
+        [SerializeField] bool _useTimeSlicedEvaluate;
+        [SerializeField] int _timeSlicedEvaluateTilesPerFrame = 48;
+        [SerializeField] int _timeSlicedEvaluateSupertilesPerFrame = 16;
+        [Tooltip("0 = unlimited. When exceeded, farthest non-want blocks are queued for unload.")]
+        [SerializeField] int _maxResidentBlocks;
+
+        [Header("Detail crossfade")]
+        [Tooltip("Dither crossfade when a detail subcell replaces its proxy.")]
+        [SerializeField] bool _enableDetailCrossfade = true;
+        [SerializeField] float _detailCrossfadeDurationSeconds = 0.12f;
+        [SerializeField] int _detailCrossfadeMaxConcurrent = 16;
+        [HideInInspector] [SerializeField] SpatialStreamingDetailCrossfade _detailCrossfade;
+
         SpatialDatasetManifest _manifest;
+        SpatialDatasetRuntimeIndex _runtimeIndex;
+        SpatialStreamingLoadedStateIndex _loadedStateIndex;
+        SpatialStreamingCoverageRefCounts _coverage;
+        SpatialStreamingHlodDag _hlodDag;
+        readonly SpatialStreamingEvaluateSliceState _evaluateSliceState = new();
         SpatialStreamingDebugHud _debugHud;
         readonly SpatialStreamingPerformanceTracker _performanceTracker = new();
         string _datasetRoot;
@@ -77,11 +98,63 @@ namespace ZGConnect.SpatialStreaming
         readonly Dictionary<string, float> _loadBlockedUntil = new();
 
         const float LoadFailureRetrySeconds = 30f;
-        const float MaxSaneLoadDistanceMeters = 50000f;
+        const float CommitRejectRetrySeconds = 15f;
+        const float StaleLoadingTimeoutSeconds = 90f;
 
         readonly Dictionary<string, SpatialLoadedSubcellRecord> _loaded = new();
         readonly HashSet<string> _loading = new();
+        readonly HashSet<string> _cancelledLoads = new();
+        readonly Dictionary<string, float> _loadingStartedAt = new();
         readonly List<SpatialStreamingHlodEvaluator.LoadRequest> _pending = new();
+        readonly HashSet<string> _loadedKeysScratch = new();
+        readonly HashSet<string> _evaluateWantScratch = new(512);
+        readonly HashSet<string> _evaluatePendingKeysScratch = new(512);
+        readonly List<SpatialStreamingHlodEvaluator.LoadRequest> _evaluatedPendingScratch = new(128);
+        readonly HashSet<string> _visibilityRefreshScratch = new(32);
+        readonly HashSet<string> _pendingVisibilityKeys = new(64);
+        readonly List<string> _visibilityQueueDrainScratch = new(64);
+        readonly List<string> _fullVisibilityRefreshKeys = new(512);
+        readonly HashSet<string> _pendingUnloadKeys = new(128);
+        readonly List<string> _unloadDrainScratch = new(128);
+        readonly HashSet<string> _wantSnapshot = new(512);
+        readonly List<string> _evaluateLoadedKeySnapshot = new(512);
+        readonly HashSet<string> _evaluateLoadedKeySnapshotSet = new(512);
+        readonly Dictionary<string, SpatialStreamingHlodEvaluator.LoadRequest> _mergeEvaluatedByKeyScratch =
+            new(128);
+        readonly HashSet<string> _mergeExistingPendingKeysScratch = new(128);
+        readonly List<string> _loadingCancelScratch = new(16);
+        readonly HashSet<string> _detailCompleteTileIdsCache = new(32);
+        int _evaluateSupersedeCursor;
+        int _evaluateWantUnloadCursor;
+        bool _evaluateCleanupActive;
+        int _detailCompleteTileIdsRevision = -1;
+        int _fullVisibilityRefreshCursor;
+        int _fullVisibilityRefreshRevision = -1;
+        Vector3 _lastEvaluateCamPos;
+        bool _hasEvaluateCamPos;
+        SpatialStreamingTileRingUtility.CameraTileGrid _lastEvaluateCameraTile;
+        bool _hasEvaluateCameraTile;
+        bool _evaluateFullRingPass = true;
+        float _nextIdleEvaluate;
+        float _nextStatsRefresh;
+        Vector3 _lastVisibilityCamPos;
+        bool _hasVisibilityCamPos;
+        int _loadedRevision;
+        int _lastEvaluateLoadedRevision = -1;
+        int _lastVisibilityLoadedRevision;
+        bool _pendingSortDirty = true;
+        Vector3 _lastPendingSortCamPos;
+        int _lodContextFrame = -1;
+        SpatialStreamingLodSubstitution.Context _lodContext;
+        const float MinEvaluateCameraMoveMeters = 2f;
+        const float VisibilityCameraMoveMeters = 1f;
+        const float StatsRefreshIntervalSeconds = 0.25f;
+        const int VisibilityKeysPerFrameWhileLoading = 8;
+        const int VisibilityWorkBudgetPerFrame = 32;
+        const int UnloadsPerFrame = 4;
+        const int UnloadsPerFrameWhenBacklogged = 2;
+        const int UnloadBacklogThreshold = 32;
+        const int EvaluateCleanupRecordsPerFrame = 24;
 
         public SpatialDatasetManifest Manifest => _manifest;
         public IReadOnlyDictionary<string, SpatialLoadedSubcellRecord> LoadedBlocks => _loaded;
@@ -102,9 +175,38 @@ namespace ZGConnect.SpatialStreaming
             }
 
             _datasetRoot = SpatialStreamingPaths.DatasetRoot;
-            SyncLegacyDistanceFields();
+            SyncTileRings();
+            EnsureDetailCrossfade();
             LoadManifest();
         }
+
+        void EnsureDetailCrossfade()
+        {
+            if (_detailCrossfade == null)
+                _detailCrossfade = GetComponent<SpatialStreamingDetailCrossfade>();
+
+            if (_detailCrossfade == null)
+                _detailCrossfade = gameObject.AddComponent<SpatialStreamingDetailCrossfade>();
+
+            SyncDetailCrossfadeSettings();
+        }
+
+        void SyncDetailCrossfadeSettings()
+        {
+            if (_detailCrossfade == null)
+                return;
+
+            _detailCrossfade.Configure(_detailCrossfadeDurationSeconds, _detailCrossfadeMaxConcurrent);
+        }
+
+#if UNITY_EDITOR
+        void OnValidate()
+        {
+            SyncTileRings();
+            EnsureDetailCrossfade();
+            SyncDebugHudSettings();
+        }
+#endif
 
         void Start()
         {
@@ -125,6 +227,21 @@ namespace ZGConnect.SpatialStreaming
 
             ValidateDatasetBundles();
             EnsureDebugHud();
+            KickInitialStreamingEvaluation();
+        }
+
+        void KickInitialStreamingEvaluation()
+        {
+            if (_manifest == null || _cam == null)
+                return;
+
+            _nextCheck = 0f;
+            SyncTileRings();
+            _lastEvaluateCamPos = _cam.position;
+            _hasEvaluateCamPos = true;
+            EvaluateStreaming();
+            ProcessPendingLoads();
+            UpdateLodVisibility();
         }
 
         void ValidateDatasetBundles()
@@ -148,9 +265,36 @@ namespace ZGConnect.SpatialStreaming
 
             _datasetBundlesAvailable = false;
             _lastLoadError = $"Sample bundle missing: {sampleFull}";
+            int manifestTiles = _manifest.Tiles?.Count ?? 0;
+            int tilesOnDisk = CountTilesWithBundlesOnDisk();
             Debug.LogError(
                 $"[ZGConnect.Spatial] bundles_spatial/ exists but manifest bundle '{sampleRel}' was not found. " +
-                "Re-run Spatial Streaming Bake for the current manifest.");
+                $"Manifest lists {manifestTiles} tile(s); ~{tilesOnDisk} have bundle folders on disk. " +
+                "Open ZG Connect → Spatial Streaming and use 'Sync manifest to bundles on disk', " +
+                "or re-run Spatial Streaming Bake for the tiles you need.");
+        }
+
+        static int CountTilesWithBundlesOnDisk()
+        {
+            string bundlesRoot = SpatialStreamingPaths.SpatialBundlesRoot;
+            if (!Directory.Exists(bundlesRoot))
+                return 0;
+
+            int count = 0;
+            foreach (string tileDir in Directory.GetDirectories(bundlesRoot))
+            {
+                string name = Path.GetFileName(tileDir);
+                if (string.IsNullOrEmpty(name) || name.StartsWith("hlod", System.StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (Directory.EnumerateFiles(tileDir).Any(path =>
+                        !path.EndsWith(".meta", System.StringComparison.OrdinalIgnoreCase)))
+                {
+                    count++;
+                }
+            }
+
+            return count;
         }
 
         bool TryFindSampleBundlePath(out string bundleRel, out string bundleFull)
@@ -217,28 +361,187 @@ namespace ZGConnect.SpatialStreaming
             if (_manifest == null || _cam == null)
                 return;
 
-            if (Time.time < _nextCheck)
-                return;
-
-            _nextCheck = Time.time + Mathf.Max(0.05f, _checkInterval);
-            SyncLegacyDistanceFields();
-
-            Profiler.BeginSample("SpatialStreaming.Evaluate");
-            EvaluateStreaming();
-            Profiler.EndSample();
+            PruneStaleLoading();
 
             Profiler.BeginSample("SpatialStreaming.ProcessPendingLoads");
             ProcessPendingLoads();
             Profiler.EndSample();
 
-            UpdateLodVisibility();
-            RefreshStats();
+            int visibilityBudget = _loading.Count > 0
+                ? VisibilityKeysPerFrameWhileLoading
+                : VisibilityWorkBudgetPerFrame;
+            visibilityBudget -= ProcessVisibilityQueue(visibilityBudget);
+            UpdateLodVisibility(visibilityBudget);
+
+            ProcessEvaluateCleanup(EvaluateCleanupRecordsPerFrame);
+
+            if (Time.time >= _nextCheck)
+            {
+                _nextCheck = Time.time + Mathf.Max(0.05f, _checkInterval);
+
+                if (ShouldRunStreamingEvaluate())
+                {
+                    _lastEvaluateCamPos = _cam.position;
+                    _hasEvaluateCamPos = true;
+
+                    Profiler.BeginSample("SpatialStreaming.Evaluate");
+                    EvaluateStreaming();
+                    Profiler.EndSample();
+                }
+            }
+
+            if (ShouldRefreshStats())
+                RefreshStats();
+
+            ProcessPendingUnloads(ResolveUnloadsPerFrame());
+        }
+
+        bool ShouldRefreshStats()
+        {
+            if (_showDebugHud)
+                return true;
+
+            return _enablePerformanceProfiling && Time.unscaledTime >= _nextStatsRefresh;
+        }
+
+        void MarkStatsRefreshed() =>
+            _nextStatsRefresh = Time.unscaledTime + StatsRefreshIntervalSeconds;
+
+        bool NeedsFullVisibilityRefresh()
+        {
+            if (_loaded.Count == 0 || _loading.Count > 0)
+                return false;
+
+            if (_loadedRevision != _lastVisibilityLoadedRevision)
+                return true;
+
+            if (!_hasVisibilityCamPos)
+                return true;
+
+            return (_cam.position - _lastVisibilityCamPos).sqrMagnitude >=
+                   VisibilityCameraMoveMeters * VisibilityCameraMoveMeters;
+        }
+
+        bool IsFullVisibilityRefreshInProgress() =>
+            _fullVisibilityRefreshCursor < _fullVisibilityRefreshKeys.Count;
+
+        void BeginFullVisibilityRefresh()
+        {
+            _fullVisibilityRefreshKeys.Clear();
+            foreach (KeyValuePair<string, SpatialLoadedSubcellRecord> kvp in _loaded)
+                _fullVisibilityRefreshKeys.Add(kvp.Key);
+
+            _fullVisibilityRefreshCursor = 0;
+            _fullVisibilityRefreshRevision = _loadedRevision;
+            _pendingVisibilityKeys.Clear();
+        }
+
+        void MarkLodVisibilityRefreshed()
+        {
+            _lastVisibilityLoadedRevision = _loadedRevision;
+            _lastVisibilityCamPos = _cam.position;
+            _hasVisibilityCamPos = true;
+        }
+
+        void MarkLoadedStateDirty()
+        {
+            _loadedRevision++;
+            _pendingSortDirty = true;
+            _lodContextFrame = -1;
+            _detailCompleteTileIdsRevision = -1;
+        }
+
+        SpatialStreamingLodSubstitution.Context GetOrBuildLodContext()
+        {
+            if (_lodContextFrame != Time.frameCount)
+            {
+                _lodContext = BuildLodContext();
+                _lodContextFrame = Time.frameCount;
+            }
+
+            return _lodContext;
+        }
+
+        bool ShouldRunStreamingEvaluate()
+        {
+            if (_loaded.Count == 0 || !_hasEvaluateCamPos)
+                return true;
+
+            if (_loadedRevision != _lastEvaluateLoadedRevision)
+            {
+                _evaluateFullRingPass = true;
+                return true;
+            }
+
+            if (_loading.Count > 0 || _pending.Count > 0)
+            {
+                _evaluateFullRingPass = false;
+                return false;
+            }
+
+            if (HasExpiredLoadBlocks())
+            {
+                _evaluateFullRingPass = false;
+                return true;
+            }
+
+            var cameraTile = default(SpatialStreamingTileRingUtility.CameraTileGrid);
+            bool hasCameraTile = _runtimeIndex != null
+                ? _runtimeIndex.TryResolveCameraTileGrid(_cam.position, out cameraTile)
+                : SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(_manifest, _cam.position, out cameraTile);
+
+            if (hasCameraTile && _hasEvaluateCameraTile &&
+                (cameraTile.GridX != _lastEvaluateCameraTile.GridX ||
+                 cameraTile.GridZ != _lastEvaluateCameraTile.GridZ))
+            {
+                _evaluateFullRingPass = true;
+                return true;
+            }
+
+            float moveThreshold = Mathf.Max(
+                MinEvaluateCameraMoveMeters,
+                (_manifest?.SubcellSizeMeters ?? 250) * 0.1f);
+            if ((_cam.position - _lastEvaluateCamPos).sqrMagnitude >= moveThreshold * moveThreshold)
+            {
+                _evaluateFullRingPass = true;
+                return true;
+            }
+
+            if (Time.time < _nextIdleEvaluate)
+                return false;
+
+            _nextIdleEvaluate = Time.time + Mathf.Max(0.15f, _checkInterval);
+            _evaluateFullRingPass = false;
+            return false;
+        }
+
+        bool HasExpiredLoadBlocks()
+        {
+            if (_loadBlockedUntil.Count == 0)
+                return false;
+
+            float now = Time.time;
+            foreach (KeyValuePair<string, float> blocked in _loadBlockedUntil)
+            {
+                if (now >= blocked.Value)
+                    return true;
+            }
+
+            return false;
+        }
+
+        void BlockLoadCommitReject(string key)
+        {
+            if (string.IsNullOrEmpty(key))
+                return;
+
+            _loadBlockedUntil[key] = Time.time + CommitRejectRetrySeconds;
         }
 
         void LateUpdate()
         {
-            if (HasAnyDetailSubstitutionInProgress() && _manifest != null && _cam != null)
-                UpdateLodVisibility();
+            if (_detailCrossfade != null && _detailCrossfade.HasActiveTransitions && _cam != null)
+                UpdateCrossfadeVisibility();
 
             if (!_enablePerformanceProfiling)
                 return;
@@ -251,108 +554,217 @@ namespace ZGConnect.SpatialStreaming
                 _spikeFrameMsThreshold);
         }
 
-        bool HasAnyDetailSubstitutionInProgress()
+        SpatialStreamingLodSubstitution.Context BuildLodContext()
         {
-            foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
+            Vector3 camPos = _cam != null ? _cam.position : Vector3.zero;
+            var cameraTile = default(SpatialStreamingTileRingUtility.CameraTileGrid);
+            if (_manifest != null)
             {
-                if (record?.Root == null ||
-                    string.IsNullOrEmpty(record.TileId))
-                {
-                    continue;
-                }
-
-                if (record.LodLevel == SpatialStreamingLodLevel.TileProxy &&
-                    ShouldHideTileProxyForTile(record.TileId))
-                {
-                    return true;
-                }
-
-                if (record.LodLevel != SpatialStreamingLodLevel.SubcellProxy ||
-                    string.IsNullOrEmpty(record.SubcellId))
-                {
-                    continue;
-                }
-
-                if (_loading.Contains(SpatialStreamingHlodEvaluator.BuildDetailKey(record.TileId, record.SubcellId)))
-                    return true;
+                SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(
+                    _manifest,
+                    _runtimeIndex,
+                    camPos,
+                    out cameraTile);
             }
 
-            return false;
-        }
+            _loadedKeysScratch.Clear();
+            foreach (string key in _loaded.Keys)
+                _loadedKeysScratch.Add(key);
 
-        HashSet<string> BuildDetailCompleteTileIds()
-        {
-            var complete = new HashSet<string>();
-            if (_manifest?.Tiles == null)
-                return complete;
+            _evaluateSliceState.Enabled = _useTimeSlicedEvaluate && !_evaluateFullRingPass;
+            _evaluateSliceState.TileBudgetPerEvaluate = Mathf.Max(1, _timeSlicedEvaluateTilesPerFrame);
+            _evaluateSliceState.SupertileBudgetPerEvaluate = Mathf.Max(1, _timeSlicedEvaluateSupertilesPerFrame);
 
-            foreach (SpatialTileManifestEntry tile in _manifest.Tiles)
+            return new SpatialStreamingLodSubstitution.Context
             {
-                if (tile != null && IsTileDetailComplete(tile.TileId))
-                    complete.Add(tile.TileId);
-            }
-
-            return complete;
-        }
-
-        void SyncLegacyDistanceFields()
-        {
-            SanitizeDistancePair(
-                ref _detailTileLoadDistanceMeters,
-                ref _detailTileUnloadDistanceMeters,
-                SpatialStreamingHlodDistances.Default.detailLoadMeters,
-                SpatialStreamingHlodDistances.Default.detailUnloadMeters,
-                "Detail tile");
-            SanitizeDistancePair(
-                ref _proxyLoadDistanceMeters,
-                ref _proxyUnloadDistanceMeters,
-                SpatialStreamingHlodDistances.Default.proxyLoadMeters,
-                SpatialStreamingHlodDistances.Default.proxyUnloadMeters,
-                "Proxy");
-            SanitizeDistancePair(
-                ref _hlod2LoadDistanceMeters,
-                ref _hlod2UnloadDistanceMeters,
-                SpatialStreamingHlodDistances.Default.hlod2LoadMeters,
-                SpatialStreamingHlodDistances.Default.hlod2UnloadMeters,
-                "HLOD2");
-            SanitizeDistancePair(
-                ref _hlod4LoadDistanceMeters,
-                ref _hlod4UnloadDistanceMeters,
-                SpatialStreamingHlodDistances.Default.hlod4LoadMeters,
-                SpatialStreamingHlodDistances.Default.hlod4UnloadMeters,
-                "HLOD4");
-
-            _hlodDistances = new SpatialStreamingHlodDistances
-            {
-                detailLoadMeters = _detailTileLoadDistanceMeters,
-                detailUnloadMeters = _detailTileUnloadDistanceMeters,
-                proxyLoadMeters = _proxyLoadDistanceMeters,
-                proxyUnloadMeters = _proxyUnloadDistanceMeters,
-                hlod2LoadMeters = _hlod2LoadDistanceMeters,
-                hlod2UnloadMeters = _hlod2UnloadDistanceMeters,
-                hlod4LoadMeters = _hlod4LoadDistanceMeters,
-                hlod4UnloadMeters = _hlod4UnloadDistanceMeters,
+                Manifest = _manifest,
+                RuntimeIndex = _runtimeIndex,
+                LoadedState = _loadedStateIndex,
+                Coverage = _coverage,
+                Dag = _hlodDag,
+                CameraPosition = camPos,
+                Rings = _tileRings,
+                CameraTile = cameraTile,
+                EnableHlod = _enableHlod,
+                LoadedKeys = _loadedKeysScratch,
+                LoadingKeys = _loading,
+                LoadedRecords = _loaded,
+                Hlod2ByBlock = _loadedStateIndex?.Hlod2ByBlock,
+                Hlod4ByBlock = _loadedStateIndex?.Hlod4ByBlock,
+                UseScreenSpaceLodPriority = _useScreenSpaceLodPriority,
+                ScreenSpaceFovDegrees = _screenSpaceFovDegrees,
+                EvaluateSlice = _evaluateSliceState,
             };
         }
 
-        void SanitizeDistancePair(
-            ref float loadMeters,
-            ref float unloadMeters,
-            float defaultLoad,
-            float defaultUnload,
-            string label)
+        HashSet<string> GetDetailCompleteTileIdsCached()
         {
-            if (loadMeters <= 0f ||
-                unloadMeters <= 0f ||
-                loadMeters > MaxSaneLoadDistanceMeters ||
-                loadMeters > unloadMeters)
+            if (_detailCompleteTileIdsRevision == _loadedRevision)
+                return _detailCompleteTileIdsCache;
+
+            _detailCompleteTileIdsCache.Clear();
+            if (_manifest?.Tiles == null || _cam == null)
             {
-                Debug.LogWarning(
-                    $"[ZGConnect.Spatial] {label} distances invalid ({loadMeters:F0}/{unloadMeters:F0} m) — " +
-                    $"using defaults ({defaultLoad:F0}/{defaultUnload:F0} m).");
-                loadMeters = defaultLoad;
-                unloadMeters = defaultUnload;
+                _detailCompleteTileIdsRevision = _loadedRevision;
+                return _detailCompleteTileIdsCache;
             }
+
+            if (!SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(
+                    _manifest,
+                    _runtimeIndex,
+                    _cam.position,
+                    out var cameraTile))
+            {
+                _detailCompleteTileIdsRevision = _loadedRevision;
+                return _detailCompleteTileIdsCache;
+            }
+
+            int maxRing = _tileRings.FurthestConfiguredRingEnd + 1;
+
+            IEnumerable<SpatialTileManifestEntry> tiles = _runtimeIndex != null
+                ? _runtimeIndex.CollectTilesInRing(cameraTile, maxRing + 1)
+                : _manifest.Tiles;
+
+            foreach (SpatialTileManifestEntry tile in tiles ?? Enumerable.Empty<SpatialTileManifestEntry>())
+            {
+                if (tile == null || string.IsNullOrEmpty(tile.TileId))
+                    continue;
+
+                if (IsTileDetailComplete(tile.TileId))
+                    _detailCompleteTileIdsCache.Add(tile.TileId);
+            }
+
+            _detailCompleteTileIdsRevision = _loadedRevision;
+            return _detailCompleteTileIdsCache;
+        }
+
+        void BeginEvaluateCleanup(HashSet<string> want)
+        {
+            _wantSnapshot.Clear();
+            foreach (string key in want)
+                _wantSnapshot.Add(key);
+
+            if (!_evaluateCleanupActive)
+            {
+                _evaluateLoadedKeySnapshot.Clear();
+                _evaluateLoadedKeySnapshotSet.Clear();
+                foreach (string key in _loaded.Keys)
+                {
+                    _evaluateLoadedKeySnapshotSet.Add(key);
+                    _evaluateLoadedKeySnapshot.Add(key);
+                }
+
+                _evaluateSupersedeCursor = 0;
+                _evaluateWantUnloadCursor = 0;
+                _evaluateCleanupActive = _evaluateLoadedKeySnapshot.Count > 0;
+                return;
+            }
+
+            foreach (string key in _loaded.Keys)
+            {
+                if (_evaluateLoadedKeySnapshotSet.Add(key))
+                    _evaluateLoadedKeySnapshot.Add(key);
+            }
+        }
+
+        int ResolveUnloadsPerFrame()
+        {
+            if (_pendingUnloadKeys.Count >= UnloadBacklogThreshold)
+                return UnloadsPerFrameWhenBacklogged;
+
+            return UnloadsPerFrame;
+        }
+
+        void ProcessEvaluateCleanup(int recordBudget)
+        {
+            if (!_evaluateCleanupActive || recordBudget <= 0)
+                return;
+
+            Profiler.BeginSample("SpatialStreaming.EvaluateCleanup");
+            SpatialStreamingLodSubstitution.Context ctx = GetOrBuildLodContext();
+            int processed = 0;
+
+            while (_evaluateSupersedeCursor < _evaluateLoadedKeySnapshot.Count && processed < recordBudget)
+            {
+                string key = _evaluateLoadedKeySnapshot[_evaluateSupersedeCursor++];
+                if (!_loaded.TryGetValue(key, out SpatialLoadedSubcellRecord record) || record == null)
+                    continue;
+
+                processed++;
+                switch (record.LodLevel)
+                {
+                    case SpatialStreamingLodLevel.SubcellProxy:
+                        if (SpatialStreamingLodSubstitution.ShouldKeepSubcellProxyRecord(ctx, record))
+                            break;
+
+                        if (_detailCrossfade != null && _detailCrossfade.IsTransitioningProxy(key))
+                            break;
+
+                        EnqueueUnload(key);
+                        break;
+
+                    case SpatialStreamingLodLevel.TileProxy:
+                        if (SpatialStreamingLodSubstitution.ShouldKeepTileProxy(ctx, record.TileId))
+                            break;
+
+                        EnqueueUnload(key);
+                        break;
+                }
+            }
+
+            bool skipWantUnload = _useTimeSlicedEvaluate && !_evaluateFullRingPass;
+            if (!skipWantUnload)
+            {
+                while (_evaluateWantUnloadCursor < _evaluateLoadedKeySnapshot.Count && processed < recordBudget)
+                {
+                    string key = _evaluateLoadedKeySnapshot[_evaluateWantUnloadCursor++];
+                    if (_wantSnapshot.Contains(key) || _loading.Contains(key))
+                    {
+                        if (_pendingUnloadKeys.Remove(key))
+                            EnqueueVisibilityKey(key);
+                        continue;
+                    }
+
+                    if (_loaded.TryGetValue(key, out SpatialLoadedSubcellRecord record) && record != null)
+                    {
+                        switch (record.LodLevel)
+                        {
+                            case SpatialStreamingLodLevel.SubcellProxy:
+                                if (SpatialStreamingLodSubstitution.ShouldKeepSubcellProxyRecord(ctx, record))
+                                    continue;
+                                break;
+                            case SpatialStreamingLodLevel.TileProxy:
+                                if (SpatialStreamingLodSubstitution.ShouldKeepTileProxy(ctx, record.TileId))
+                                    continue;
+                                break;
+                        }
+                    }
+
+                    processed++;
+                    EnqueueUnload(key);
+                }
+            }
+
+            if (_evaluateSupersedeCursor >= _evaluateLoadedKeySnapshot.Count &&
+                (skipWantUnload || _evaluateWantUnloadCursor >= _evaluateLoadedKeySnapshot.Count))
+            {
+                _evaluateCleanupActive = false;
+                _evaluateLoadedKeySnapshotSet.Clear();
+            }
+
+            Profiler.EndSample();
+        }
+
+        void SyncTileRings()
+        {
+            _tileRings = new SpatialStreamingTileRings
+            {
+                detailRings = Mathf.Max(0, _detailRings),
+                subcellProxyRings = Mathf.Max(0, _subcellProxyRings),
+                tileProxyRings = Mathf.Max(0, _tileProxyRings),
+                hlod2x2Rings = Mathf.Max(0, _hlod2x2Rings),
+                hlod4x4Rings = Mathf.Max(0, _hlod4x4Rings),
+            };
         }
 
         public void LoadManifest()
@@ -364,49 +776,322 @@ namespace ZGConnect.SpatialStreaming
                     _manifestRelativePath.Replace('/', Path.DirectorySeparatorChar));
 
             _manifest = SpatialDatasetManifest.LoadFromFile(path);
+            RebuildRuntimeIndexes();
+        }
+
+        void RebuildRuntimeIndexes()
+        {
+            _runtimeIndex = SpatialDatasetRuntimeIndex.Build(_manifest);
+            _hlodDag = SpatialStreamingHlodDag.Build(_runtimeIndex, _manifest);
+            _loadedStateIndex = new SpatialStreamingLoadedStateIndex(_runtimeIndex);
+            _coverage = new SpatialStreamingCoverageRefCounts(_runtimeIndex, _loadedStateIndex, _hlodDag);
+            _loadedStateIndex.RebuildFromLoaded(_loaded);
+            _coverage.RebuildAll();
+            _lodContextFrame = -1;
         }
 
         void EvaluateStreaming()
         {
             Vector3 camPos = _cam.position;
-            var want = new HashSet<string>();
-            var pendingKeys = new HashSet<string>();
+            _evaluateWantScratch.Clear();
+            _evaluatePendingKeysScratch.Clear();
             foreach (SpatialStreamingHlodEvaluator.LoadRequest request in _pending)
-                pendingKeys.Add(request.Key);
+                _evaluatePendingKeysScratch.Add(request.Key);
+
+            foreach (string loadingKey in _loading)
+                _evaluatePendingKeysScratch.Add(loadingKey);
 
             PruneExpiredLoadBlocks();
             foreach (KeyValuePair<string, float> blocked in _loadBlockedUntil)
-                pendingKeys.Add(blocked.Key);
+                _evaluatePendingKeysScratch.Add(blocked.Key);
 
-            _pending.Clear();
+            _evaluatedPendingScratch.Clear();
+            SpatialStreamingLodSubstitution.Context ctx = BuildLodContext();
 
-            var loadedKeys = new HashSet<string>(_loaded.Keys);
-            HashSet<string> detailCompleteTileIds = BuildDetailCompleteTileIds();
+            var loadedKeys = ctx.LoadedKeys;
+            HashSet<string> detailCompleteTileIds = GetDetailCompleteTileIdsCached();
             SpatialStreamingHlodEvaluator.Evaluate(
                 _manifest,
                 camPos,
-                _hlodDistances,
+                _tileRings,
                 _enableHlod,
                 detailCompleteTileIds,
-                want,
-                _pending,
+                _evaluateWantScratch,
+                _evaluatedPendingScratch,
                 _loading,
                 loadedKeys,
-                pendingKeys);
+                _evaluatePendingKeysScratch,
+                _loaded,
+                ctx);
 
-            foreach (string key in _loaded.Keys.ToList())
+            MergePendingList(_evaluatedPendingScratch, _evaluateWantScratch, ctx);
+            StripCoarseRequestsSupersededByDetail(_evaluateWantScratch, _pending);
+            EnsureSubstitutionWant(_evaluateWantScratch);
+
+            BeginEvaluateCleanup(_evaluateWantScratch);
+
+            if (_maxResidentBlocks > 0)
             {
-                if (!want.Contains(key))
-                    UnloadBlock(key);
+                SpatialStreamingResidencyBudget.EnforceBudget(
+                    _maxResidentBlocks,
+                    _loaded,
+                    _evaluateWantScratch,
+                    camPos,
+                    EnqueueUnload);
             }
 
-            foreach (string key in _loading.ToList())
+            if (_runtimeIndex != null)
+                _runtimeIndex.TryResolveCameraTileGrid(camPos, out _lastEvaluateCameraTile);
+            else
+                SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(_manifest, camPos, out _lastEvaluateCameraTile);
+
+            _hasEvaluateCameraTile = true;
+            _evaluateFullRingPass = false;
+
+            _loadingCancelScratch.Clear();
+            foreach (string key in _loading)
+                _loadingCancelScratch.Add(key);
+
+            foreach (string key in _loadingCancelScratch)
             {
-                if (!want.Contains(key))
-                    _loading.Remove(key);
+                if (!_evaluateWantScratch.Contains(key))
+                    _cancelledLoads.Add(key);
             }
 
-            PrunePendingNotWanted(want);
+            _lastEvaluateLoadedRevision = _loadedRevision;
+        }
+
+        void EnsureSubstitutionWant(HashSet<string> want)
+        {
+            foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
+            {
+                if (record == null || record.LodLevel != SpatialStreamingLodLevel.Detail)
+                    continue;
+
+                string tileId = record.TileId;
+                string subcellId = record.SubcellId;
+                if (string.IsNullOrEmpty(tileId) || string.IsNullOrEmpty(subcellId))
+                {
+                    if (!SpatialStreamingLodSubstitution.TryParseDetailKey(record.Key, out tileId, out subcellId))
+                        continue;
+                }
+
+                want.Remove(SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tileId, subcellId));
+            }
+        }
+
+        void StripCoarseRequestsSupersededByDetail(
+            HashSet<string> want,
+            List<SpatialStreamingHlodEvaluator.LoadRequest> pending)
+        {
+            if (_loaded.Count == 0)
+                return;
+
+            foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
+            {
+                if (record == null || record.LodLevel != SpatialStreamingLodLevel.Detail)
+                    continue;
+
+                string tileId = record.TileId;
+                string subcellId = record.SubcellId;
+                if (string.IsNullOrEmpty(tileId) || string.IsNullOrEmpty(subcellId))
+                {
+                    if (!SpatialStreamingLodSubstitution.TryParseDetailKey(record.Key, out tileId, out subcellId))
+                        continue;
+                }
+
+                string proxyKey = SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tileId, subcellId);
+                want.Remove(proxyKey);
+                CancelLoadRequest(proxyKey);
+
+                if (pending != null)
+                {
+                    for (int i = pending.Count - 1; i >= 0; i--)
+                    {
+                        if (pending[i].Key == proxyKey)
+                            pending.RemoveAt(i);
+                    }
+                }
+            }
+        }
+
+        void EnqueueUnload(string key)
+        {
+            if (string.IsNullOrEmpty(key) || !_loaded.ContainsKey(key))
+                return;
+
+            _pendingUnloadKeys.Add(key);
+        }
+
+        void ProcessPendingUnloads(int maxUnloads)
+        {
+            if (maxUnloads <= 0 || _pendingUnloadKeys.Count == 0)
+                return;
+
+            Profiler.BeginSample("SpatialStreaming.ProcessPendingUnloads");
+
+            _unloadDrainScratch.Clear();
+            foreach (string key in _pendingUnloadKeys)
+            {
+                _unloadDrainScratch.Add(key);
+                if (_unloadDrainScratch.Count >= maxUnloads)
+                    break;
+            }
+
+            for (int i = 0; i < _unloadDrainScratch.Count; i++)
+            {
+                string key = _unloadDrainScratch[i];
+                if (!_pendingUnloadKeys.Remove(key))
+                    continue;
+
+                if (!_loaded.ContainsKey(key))
+                    continue;
+
+                if (_loaded.TryGetValue(key, out SpatialLoadedSubcellRecord record) &&
+                    record?.Root != null &&
+                    record.Root.activeSelf)
+                {
+                    record.Root.SetActive(false);
+                }
+
+                UnloadBlock(key);
+            }
+
+            Profiler.EndSample();
+        }
+
+        void CancelLoadRequest(string key)
+        {
+            if (string.IsNullOrEmpty(key))
+                return;
+
+            _cancelledLoads.Add(key);
+
+            for (int i = _pending.Count - 1; i >= 0; i--)
+            {
+                if (_pending[i].Key == key)
+                    _pending.RemoveAt(i);
+            }
+        }
+
+        const int MaxNewPendingPerEvaluate = 64;
+        const int MaxPendingBeforeCoarseThrottle = 96;
+        const int MaxCoarseAddsWhenBacklogged = 8;
+
+        void MergePendingList(
+            List<SpatialStreamingHlodEvaluator.LoadRequest> evaluated,
+            HashSet<string> want,
+            SpatialStreamingLodSubstitution.Context ctx)
+        {
+            evaluated ??= _evaluatedPendingScratch;
+            if (ctx.Manifest == null)
+                ctx = BuildLodContext();
+
+            _mergeEvaluatedByKeyScratch.Clear();
+            foreach (SpatialStreamingHlodEvaluator.LoadRequest request in evaluated)
+            {
+                if (!_mergeEvaluatedByKeyScratch.ContainsKey(request.Key))
+                    _mergeEvaluatedByKeyScratch[request.Key] = request;
+            }
+
+            for (int i = _pending.Count - 1; i >= 0; i--)
+            {
+                SpatialStreamingHlodEvaluator.LoadRequest request = _pending[i];
+                if (!want.Contains(request.Key) ||
+                    _loaded.ContainsKey(request.Key) ||
+                    _loading.Contains(request.Key))
+                {
+                    _pending.RemoveAt(i);
+                    continue;
+                }
+
+                if (_mergeEvaluatedByKeyScratch.TryGetValue(request.Key, out SpatialStreamingHlodEvaluator.LoadRequest fresh))
+                    _pending[i] = fresh;
+            }
+
+            _mergeExistingPendingKeysScratch.Clear();
+            foreach (SpatialStreamingHlodEvaluator.LoadRequest request in _pending)
+                _mergeExistingPendingKeysScratch.Add(request.Key);
+
+            evaluated.Sort((a, b) => SpatialStreamingLodSubstitution.CompareLoadRequests(ctx, a, b));
+
+            bool backlog = _pending.Count >= MaxPendingBeforeCoarseThrottle;
+            int added = 0;
+            int coarseAdded = 0;
+            foreach (SpatialStreamingHlodEvaluator.LoadRequest request in evaluated)
+            {
+                if (added >= MaxNewPendingPerEvaluate)
+                    break;
+
+                if (!want.Contains(request.Key))
+                    continue;
+
+                if (_loaded.ContainsKey(request.Key) ||
+                    _loading.Contains(request.Key) ||
+                    _mergeExistingPendingKeysScratch.Contains(request.Key))
+                {
+                    continue;
+                }
+
+                if (request.LodLevel == SpatialStreamingLodLevel.SubcellProxy &&
+                    SpatialStreamingLodSubstitution.HasDetailRecord(ctx, request.TileId, request.SubcellId))
+                {
+                    continue;
+                }
+
+                if (backlog &&
+                    request.LodLevel != SpatialStreamingLodLevel.Detail &&
+                    coarseAdded >= MaxCoarseAddsWhenBacklogged)
+                {
+                    continue;
+                }
+
+                if (IsLoadBlocked(request.Key) ||
+                    !SpatialStreamingLodSubstitution.ShouldQueueLoadRequest(ctx, request))
+                {
+                    continue;
+                }
+
+                _pending.Add(request);
+                _mergeExistingPendingKeysScratch.Add(request.Key);
+                added++;
+                _pendingSortDirty = true;
+                if (request.LodLevel != SpatialStreamingLodLevel.Detail)
+                    coarseAdded++;
+            }
+        }
+
+        bool IsLoadBlocked(string key) =>
+            _loadBlockedUntil.TryGetValue(key, out float blockedUntil) && Time.time < blockedUntil;
+
+        bool ShouldAcceptLoadedBlock(SpatialStreamingHlodEvaluator.LoadRequest request) =>
+            SpatialStreamingLodSubstitution.ShouldCommitLoad(BuildLodContext(), request);
+
+        void AbortLoadedInstance(
+            GameObject instance,
+            SpatialBundleLoader.LoadResult loadResult)
+        {
+            if (instance != null)
+                SpatialObjectUtility.Destroy(instance);
+
+            if (string.IsNullOrEmpty(loadResult.BundleFullPath))
+                return;
+
+            if (loadResult.Bundle != null)
+                SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: true);
+            else if (!string.IsNullOrEmpty(loadResult.BundleFullPath))
+                SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: false);
+
+            loadResult.Bundle = null;
+        }
+
+        static void DetachBundleArchiveAfterSpawn(SpatialBundleLoader.LoadResult loadResult)
+        {
+            if (loadResult.Bundle == null || string.IsNullOrEmpty(loadResult.BundleFullPath))
+                return;
+
+            SpatialBundleLoader.ReleaseArchiveAfterSpawn(loadResult.BundleFullPath);
+            loadResult.Bundle = null;
         }
 
         void ProcessPendingLoads()
@@ -414,12 +1099,22 @@ namespace ZGConnect.SpatialStreaming
             if (_pending.Count == 0 || !_datasetBundlesAvailable)
                 return;
 
-            _pending.Sort(ComparePendingLoads);
+            bool cameraMoved = !_hasVisibilityCamPos ||
+                               (_cam.position - _lastPendingSortCamPos).sqrMagnitude >=
+                               VisibilityCameraMoveMeters * VisibilityCameraMoveMeters;
+            if (_pendingSortDirty || cameraMoved)
+            {
+                SpatialStreamingLodSubstitution.Context ctx = GetOrBuildLodContext();
+                _pending.Sort((a, b) => SpatialStreamingLodSubstitution.CompareLoadRequests(ctx, a, b));
+                _pendingSortDirty = false;
+                _lastPendingSortCamPos = _cam.position;
+            }
 
             int active = _loading.Count;
             int budget = Mathf.Max(1, _loadBudget.maxConcurrentLoads);
             float frameStart = Time.realtimeSinceStartup;
             int started = 0;
+            int skippedThisFrame = 0;
 
             while (_pending.Count > 0 && active < budget)
             {
@@ -432,13 +1127,34 @@ namespace ZGConnect.SpatialStreaming
                     break;
                 }
 
+                if (skippedThisFrame >= _pending.Count)
+                    break;
+
                 SpatialStreamingHlodEvaluator.LoadRequest request = _pending[0];
+                if (request.LodLevel == SpatialStreamingLodLevel.Detail &&
+                    SpatialStreamingLodSubstitution.CountDetailInFlightForTile(
+                        GetOrBuildLodContext(), request.TileId, null) >=
+                    SpatialStreamingLodSubstitution.MaxConcurrentDetailLoadsPerTile)
+                {
+                    _pending.RemoveAt(0);
+                    _pending.Add(request);
+                    skippedThisFrame++;
+                    continue;
+                }
+
+                skippedThisFrame = 0;
                 _pending.RemoveAt(0);
 
                 if (_loaded.ContainsKey(request.Key) || _loading.Contains(request.Key))
                     continue;
 
+                if (IsLoadBlocked(request.Key))
+                    continue;
+
                 _loading.Add(request.Key);
+                _loadingStartedAt[request.Key] = Time.time;
+                if (request.LodLevel == SpatialStreamingLodLevel.Detail && !string.IsNullOrEmpty(request.TileId))
+                    _loadedStateIndex?.RegisterDetailLoading(request.TileId);
                 active++;
                 started++;
                 if (_enablePerformanceProfiling)
@@ -447,32 +1163,107 @@ namespace ZGConnect.SpatialStreaming
             }
         }
 
-        static int ComparePendingLoads(
-            SpatialStreamingHlodEvaluator.LoadRequest a,
-            SpatialStreamingHlodEvaluator.LoadRequest b)
+        void PruneStaleLoading()
         {
-            // Coarsest LOD first (HLOD4 → HLOD2 → tile proxy → subcell proxy → detail).
-            int lodCmp = b.LodLevel.CompareTo(a.LodLevel);
-            if (lodCmp != 0)
-                return lodCmp;
+            if (_loading.Count == 0)
+                return;
 
-            return a.PriorityDistance.CompareTo(b.PriorityDistance);
+            float now = Time.time;
+            _loadingCancelScratch.Clear();
+            foreach (string key in _loading)
+                _loadingCancelScratch.Add(key);
+
+            foreach (string key in _loadingCancelScratch)
+            {
+                if (!_loadingStartedAt.TryGetValue(key, out float startedAt))
+                {
+                    _loadingStartedAt[key] = now;
+                    continue;
+                }
+
+                if (now - startedAt < StaleLoadingTimeoutSeconds)
+                    continue;
+
+                _cancelledLoads.Add(key);
+                UnregisterDetailLoadingForKey(key);
+                _loading.Remove(key);
+                _loadingStartedAt.Remove(key);
+                _loadBlockedUntil[key] = now + LoadFailureRetrySeconds;
+                Debug.LogWarning(
+                    $"[ZGConnect.Spatial] Timed out stale load '{key}' after {StaleLoadingTimeoutSeconds:F0}s — " +
+                    "slot released for retry.");
+            }
         }
 
         IEnumerator LoadBlockCoroutine(SpatialStreamingHlodEvaluator.LoadRequest request)
         {
-            Profiler.BeginSample("SpatialStreaming.LoadBlock");
+            yield return null;
+
+            IEnumerator body = LoadBlockCoroutineBody(request);
+            while (true)
+            {
+                object current;
+                try
+                {
+                    if (!body.MoveNext())
+                        break;
+
+                    current = body.Current;
+                }
+                catch (System.Exception ex)
+                {
+                    _totalLoadFailures++;
+                    _lastLoadError = ex.Message;
+                    _loadBlockedUntil[request.Key] = Time.time + LoadFailureRetrySeconds;
+                    Debug.LogError($"[ZGConnect.Spatial] Load coroutine failed for '{request.Key}': {ex}");
+                    break;
+                }
+
+                yield return current;
+            }
+
+            _loading.Remove(request.Key);
+            _loadingStartedAt.Remove(request.Key);
+            UnregisterDetailLoadingForKey(request.Key);
+        }
+
+        void UnregisterDetailLoadingForKey(string key)
+        {
+            if (_loadedStateIndex == null ||
+                !SpatialStreamingLodSubstitution.TryParseDetailKey(key, out string tileId, out _))
+            {
+                return;
+            }
+
+            _loadedStateIndex.UnregisterDetailLoading(tileId);
+        }
+
+        IEnumerator LoadBlockCoroutineBody(SpatialStreamingHlodEvaluator.LoadRequest request)
+        {
+            if (!ShouldAcceptLoadedBlock(request))
+            {
+                BlockLoadCommitReject(request.Key);
+                yield break;
+            }
+
+            float spawnMainThreadMs = 0f;
             float spawnStartMs = Time.realtimeSinceStartup * 1000f;
+            float MarkMainThread() => Time.realtimeSinceStartup * 1000f;
 
             string fullPath = SpatialStreamingPaths.ResolveDatasetRelativePath(request.BundleRel);
             var loadResult = new SpatialBundleLoader.LoadResult();
             bool useMeshDetail = ShouldLoadMeshDetail(request);
 
-            Profiler.BeginSample("SpatialStreaming.LoadBundle");
             yield return SpatialBundleLoader.LoadVisualAsync(fullPath, useMeshDetail, loadResult);
-            Profiler.EndSample();
+            if (!loadResult.Success &&
+                useMeshDetail &&
+                request.LodLevel == SpatialStreamingLodLevel.Detail)
+            {
+                loadResult = new SpatialBundleLoader.LoadResult();
+                yield return SpatialBundleLoader.LoadVisualAsync(fullPath, preferMeshDetail: false, loadResult);
+            }
 
-            _loading.Remove(request.Key);
+            yield return null;
 
             if (!loadResult.Success || (loadResult.Prefab == null && loadResult.MeshDetail == null))
             {
@@ -485,128 +1276,192 @@ namespace ZGConnect.SpatialStreaming
                         $"[ZGConnect.Spatial] Failed to load '{request.Key}': {loadResult.Error}");
                 }
 
-                Profiler.EndSample();
                 yield break;
             }
 
             _loadBlockedUntil.Remove(request.Key);
 
+            if (_cancelledLoads.Remove(request.Key))
+            {
+                SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: false);
+                yield break;
+            }
+
             if (_loaded.ContainsKey(request.Key))
             {
                 SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: false);
-                Profiler.EndSample();
+                yield break;
+            }
+
+            if (!ShouldAcceptLoadedBlock(request))
+            {
+                SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: false);
+                BlockLoadCommitReject(request.Key);
                 yield break;
             }
 
             Vector3 worldPos = ResolveInstanceWorldPosition(request);
             bool isProxyLod = IsProxyLod(request.LodLevel);
+            bool isSupertileLod = IsSupertileLod(request.LodLevel);
             GameObject instance = null;
 
-            Profiler.BeginSample("SpatialStreaming.Instantiate");
             if (loadResult.MeshDetail != null)
             {
-                instance = InstantiateMeshDetail(loadResult.MeshDetail, worldPos, _contentRoot);
-                yield return null;
+                yield return InstantiateMeshDetailRoutine(
+                    loadResult.MeshDetail,
+                    worldPos,
+                    _contentRoot,
+                    _loadBudget,
+                    created => instance = created);
             }
             else
             {
-                yield return InstantiateLoadedPrefab(loadResult.Prefab, worldPos, _contentRoot, created => instance = created);
+                yield return InstantiateLoadedPrefab(
+                    loadResult.Prefab,
+                    worldPos,
+                    _contentRoot,
+                    created => instance = created);
+                yield return null;
             }
-            Profiler.EndSample();
 
             if (instance == null)
             {
-                SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: false);
-                Profiler.EndSample();
+                if (loadResult.Bundle != null)
+                    SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: true);
+                else if (!string.IsNullOrEmpty(loadResult.BundleFullPath))
+                    SpatialBundleLoader.Release(loadResult.BundleFullPath, unloadAllLoadedObjects: false);
                 yield break;
             }
 
-            instance.name = BuildInstanceName(request);
+            instance.SetActive(false);
 
-            bool isCoarseProxy = request.LodLevel == SpatialStreamingLodLevel.TileProxy ||
-                                 request.LodLevel == SpatialStreamingLodLevel.SubcellProxy;
-
-            if (!isProxyLod || isCoarseProxy)
+            if (_cancelledLoads.Remove(request.Key) || !ShouldAcceptLoadedBlock(request))
             {
-                if (!isCoarseProxy)
-                {
-                    yield return null;
+                AbortLoadedInstance(instance, loadResult);
+                BlockLoadCommitReject(request.Key);
+                yield break;
+            }
 
-                    Profiler.BeginSample("SpatialStreaming.GpuAttach");
-                    SpatialStreamedMeshRoot.Attach(instance, _gpuSettings);
-                    Profiler.EndSample();
-                }
+            yield return SpatialSpawnFrameBudget.WaitForFinalizeSlot(_loadBudget);
 
-                if (_applyMaterialsOnLoad && _buildingSurfaceSettings != null && !loadResult.IsMeshDetail)
+            try
+            {
+                instance.name = BuildInstanceName(request);
+
+                bool isCoarseProxy = request.LodLevel == SpatialStreamingLodLevel.TileProxy ||
+                                     request.LodLevel == SpatialStreamingLodLevel.SubcellProxy;
+
+                bool deferGpuAttachForCrossfade = request.LodLevel == SpatialStreamingLodLevel.Detail &&
+                                                  _enableDetailCrossfade &&
+                                                  _detailCrossfade != null &&
+                                                  !string.IsNullOrEmpty(request.TileId) &&
+                                                  !string.IsNullOrEmpty(request.SubcellId) &&
+                                                  _loaded.ContainsKey(
+                                                      SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(
+                                                          request.TileId,
+                                                          request.SubcellId));
+
+                int meshRendererCount = 0;
+                if (_applyMaterialsOnLoad &&
+                    _buildingSurfaceSettings != null &&
+                    !loadResult.IsMeshDetail)
                 {
-                    Profiler.BeginSample("SpatialStreaming.ApplyMaterials");
+                    float materialsStart = MarkMainThread();
                     string materialTileId = ResolveMaterialTileId(request);
-                    Vector3 materialOrigin = ResolveMaterialTileOrigin(request, worldPos);
-                    int remapped = SpatialBuildingMaterialApplier.ApplyFacadeMaterialsToCombinedInstance(
+                    yield return SpatialBuildingMaterialApplier.ApplyFacadeMaterialsToCombinedInstanceRoutine(
                         instance,
                         materialTileId,
-                        materialOrigin,
+                        ResolveMaterialTileOrigin(request, worldPos),
                         _manifest?.TileSizeMeters ?? 1000,
-                        _buildingSurfaceSettings);
-                    Profiler.EndSample();
+                        _buildingSurfaceSettings,
+                        _loadBudget);
+                    spawnMainThreadMs += MarkMainThread() - materialsStart;
+                }
 
-                    if (_logStreaming && remapped > 0)
-                    {
-                        Debug.Log(
-                            $"[ZGConnect.Spatial] Remapped {remapped} material slot(s) on '{request.Key}'");
-                    }
+                if (!isCoarseProxy && !isSupertileLod && !deferGpuAttachForCrossfade)
+                {
+                    yield return SpatialSpawnFrameBudget.WaitForSpawnStep(_loadBudget);
+
+                    Profiler.BeginSample("SpatialStreaming.GpuAttach");
+                    float gpuStart = MarkMainThread();
+                    meshRendererCount = SpatialStreamedMeshRoot.Attach(instance, _gpuSettings).MeshRendererCount;
+                    spawnMainThreadMs += MarkMainThread() - gpuStart;
+                    Profiler.EndSample();
+                }
+
+                if (meshRendererCount <= 0)
+                {
+                    float countStart = MarkMainThread();
+                    meshRendererCount = instance.GetComponentsInChildren<MeshRenderer>(true).Length;
+                    spawnMainThreadMs += MarkMainThread() - countStart;
+                }
+
+                if (_debugLodTint)
+                    SpatialStreamingLodDebugTintUtility.Apply(instance, request.LodLevel);
+
+                DetachBundleArchiveAfterSpawn(loadResult);
+
+                if (_enablePerformanceProfiling)
+                    _performanceTracker.RecordSpawn(request.Key, spawnMainThreadMs);
+
+                _loaded[request.Key] = new SpatialLoadedSubcellRecord
+                {
+                    Key = request.Key,
+                    TileId = request.TileId,
+                    SubcellId = request.SubcellId,
+                    BundleFullPath = loadResult.BundleFullPath,
+                    Root = instance,
+                    Bundle = loadResult.Bundle,
+                    LoadedAt = Time.time,
+                    LodLevel = request.LodLevel,
+                    HlodFactor = request.HlodFactor,
+                    BlockLeft = request.BlockLeft,
+                    BlockBottom = request.BlockBottom,
+                    MeshRendererCount = meshRendererCount,
+                };
+
+                RegisterLoadedRecordIndexes(_loaded[request.Key]);
+                _totalInstantiated++;
+
+                MarkLoadedStateDirty();
+                EnqueueVisibilityKeysForLoad(request);
+                CommitLoadedRecordVisibility(_loaded[request.Key]);
+
+                yield return null;
+
+                if (request.LodLevel == SpatialStreamingLodLevel.Detail &&
+                    !string.IsNullOrEmpty(request.TileId) &&
+                    !string.IsNullOrEmpty(request.SubcellId))
+                {
+                    OnDetailCommitted(request.TileId, request.SubcellId);
+                }
+
+                if (!string.IsNullOrEmpty(request.TileId) && IsTileDetailComplete(request.TileId))
+                    UnloadCoarseLodForTile(request.TileId);
+
+                if (_logStreaming)
+                {
+                    float spawnWallMs = MarkMainThread() - spawnStartMs;
+                    string detailProgress = request.LodLevel == SpatialStreamingLodLevel.Detail &&
+                                            !string.IsNullOrEmpty(request.TileId)
+                        ? $" detail={CountLoadedDetailSubcellsForTile(request.TileId)}/" +
+                          $"{CountRequiredDetailSubcellsForTile(request.TileId)}"
+                        : string.Empty;
+                    Debug.Log(
+                        $"[ZGConnect.Spatial] Loaded '{request.Key}' lod={request.LodLevel} at {worldPos} " +
+                        $"renderers={meshRendererCount}{detailProgress} " +
+                        $"spawnMainMs={spawnMainThreadMs:F1} spawnWallMs={spawnWallMs:F1} from {request.BundleRel}");
                 }
             }
-
-            float spawnMs = Time.realtimeSinceStartup * 1000f - spawnStartMs;
-            if (_enablePerformanceProfiling)
-                _performanceTracker.RecordSpawn(request.Key, spawnMs);
-
-            _loaded[request.Key] = new SpatialLoadedSubcellRecord
+            finally
             {
-                Key = request.Key,
-                TileId = request.TileId,
-                SubcellId = request.SubcellId,
-                BundleFullPath = loadResult.BundleFullPath,
-                Root = instance,
-                Bundle = loadResult.Bundle,
-                LoadedAt = Time.time,
-                LodLevel = request.LodLevel,
-                HlodFactor = request.HlodFactor,
-                BlockLeft = request.BlockLeft,
-                BlockBottom = request.BlockBottom,
-            };
-
-            _totalInstantiated++;
-
-            if (request.LodLevel == SpatialStreamingLodLevel.Detail &&
-                !string.IsNullOrEmpty(request.TileId) &&
-                !string.IsNullOrEmpty(request.SubcellId))
-            {
-                UnloadSubcellProxy(request.TileId, request.SubcellId);
-                UnloadTileProxyIfProgressiveDetail(request.TileId);
+                SpatialSpawnFrameBudget.ReleaseFinalizeSlot();
             }
-
-            if (!string.IsNullOrEmpty(request.TileId) && IsTileDetailComplete(request.TileId))
-                UnloadCoarseLodForTile(request.TileId);
-
-            UpdateLodVisibility();
-
-            if (_logStreaming)
-            {
-                int renderers = instance.GetComponentsInChildren<MeshRenderer>(true).Length;
-                string detailProgress = request.LodLevel == SpatialStreamingLodLevel.Detail &&
-                                        !string.IsNullOrEmpty(request.TileId)
-                    ? $" detail={CountLoadedDetailSubcellsForTile(request.TileId)}/" +
-                      $"{CountRequiredDetailSubcellsForTile(request.TileId)}"
-                    : string.Empty;
-                Debug.Log(
-                    $"[ZGConnect.Spatial] Loaded '{request.Key}' lod={request.LodLevel} at {worldPos} " +
-                    $"renderers={renderers}{detailProgress} spawnMs={spawnMs:F1} from {request.BundleRel}");
-            }
-
-            Profiler.EndSample();
         }
+
+        static bool IsSupertileLod(SpatialStreamingLodLevel lodLevel) =>
+            lodLevel == SpatialStreamingLodLevel.Hlod2x2 ||
+            lodLevel == SpatialStreamingLodLevel.Hlod4x4;
 
         static bool IsProxyLod(SpatialStreamingLodLevel lodLevel) =>
             lodLevel == SpatialStreamingLodLevel.SubcellProxy ||
@@ -622,7 +1477,9 @@ namespace ZGConnect.SpatialStreaming
             }
 
             SpatialSubcellManifestEntry subcell = FindSubcellManifest(request.TileId, request.SubcellId);
-            return subcell != null && subcell.UsesMeshDetail;
+            return subcell != null &&
+                   subcell.UsesMeshDetail &&
+                   SpatialMeshDetailRuntime.IsAvailable;
         }
 
         SpatialSubcellManifestEntry FindSubcellManifest(string tileId, string subcellId)
@@ -640,15 +1497,21 @@ namespace ZGConnect.SpatialStreaming
             return null;
         }
 
-        static GameObject InstantiateMeshDetail(
+        static IEnumerator InstantiateMeshDetailRoutine(
             SpatialMeshDetailAsset detail,
             Vector3 worldPos,
-            Transform parent)
+            Transform parent,
+            SpatialStreamingLoadBudget budget,
+            System.Action<GameObject> onComplete)
         {
             if (detail == null)
-                return null;
+            {
+                onComplete?.Invoke(null);
+                yield break;
+            }
 
             var root = new GameObject("SpatialMeshDetail");
+            root.SetActive(false);
             if (parent != null)
                 root.transform.SetParent(parent, false);
             root.transform.SetPositionAndRotation(worldPos, Quaternion.identity);
@@ -656,8 +1519,12 @@ namespace ZGConnect.SpatialStreaming
 
             SpatialMeshDetailAsset.RendererEntry[] entries = detail.Renderers;
             if (entries == null || entries.Length == 0)
-                return root;
+            {
+                onComplete?.Invoke(root);
+                yield break;
+            }
 
+            int batch = Mathf.Max(1, budget.renderersPerSpawnStep);
             for (int i = 0; i < entries.Length; i++)
             {
                 SpatialMeshDetailAsset.RendererEntry entry = entries[i];
@@ -674,9 +1541,14 @@ namespace ZGConnect.SpatialStreaming
                 MeshRenderer renderer = child.AddComponent<MeshRenderer>();
                 if (entry.Materials != null && entry.Materials.Length > 0)
                     renderer.sharedMaterials = entry.Materials;
+
+                if ((i + 1) % batch != 0 && i + 1 < entries.Length)
+                    continue;
+
+                yield return SpatialSpawnFrameBudget.WaitForSpawnStep(budget);
             }
 
-            return root;
+            onComplete?.Invoke(root);
         }
 
         static IEnumerator InstantiateLoadedPrefab(
@@ -701,76 +1573,350 @@ namespace ZGConnect.SpatialStreaming
             if (instance != null)
             {
                 instance.transform.SetPositionAndRotation(worldPos, Quaternion.identity);
+                instance.SetActive(false);
             }
 
             onComplete(instance);
 #else
-            onComplete(Object.Instantiate(prefab, worldPos, Quaternion.identity, parent));
+            GameObject instance = Object.Instantiate(prefab, worldPos, Quaternion.identity, parent);
+            if (instance != null)
+                instance.SetActive(false);
+            onComplete(instance);
             yield break;
 #endif
         }
 
-        void UpdateLodVisibility()
+        void UpdateLodVisibility(int recordBudget = int.MaxValue)
         {
-            if (_cam == null)
+            if (_cam == null || recordBudget <= 0)
                 return;
 
-            foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
+            if (!_enableHlod || !_tileRings.UsesCoarseLodChain)
             {
-                if (record?.Root == null)
+                if (_detailCrossfade != null && _detailCrossfade.HasActiveTransitions)
+                    UpdateCrossfadeVisibility();
+
+                if (NeedsFullVisibilityRefresh())
+                    MarkLodVisibilityRefreshed();
+
+                return;
+            }
+
+            if (_loading.Count > 0)
+                return;
+
+            bool needsRefresh = NeedsFullVisibilityRefresh();
+            if (!needsRefresh && !IsFullVisibilityRefreshInProgress())
+                return;
+
+            if (needsRefresh &&
+                (!IsFullVisibilityRefreshInProgress() || _fullVisibilityRefreshRevision != _loadedRevision))
+            {
+                BeginFullVisibilityRefresh();
+            }
+
+            if (!IsFullVisibilityRefreshInProgress())
+                return;
+
+            Profiler.BeginSample("SpatialStreaming.UpdateLodVisibility");
+            SpatialStreamingLodSubstitution.Context ctx = GetOrBuildLodContext();
+
+            int processed = 0;
+            while (_fullVisibilityRefreshCursor < _fullVisibilityRefreshKeys.Count && processed < recordBudget)
+            {
+                string key = _fullVisibilityRefreshKeys[_fullVisibilityRefreshCursor++];
+                if (_loaded.TryGetValue(key, out SpatialLoadedSubcellRecord record))
+                    ApplyRecordVisibility(ctx, record);
+                processed++;
+            }
+
+            if (_fullVisibilityRefreshCursor >= _fullVisibilityRefreshKeys.Count)
+            {
+                _fullVisibilityRefreshKeys.Clear();
+                _fullVisibilityRefreshCursor = 0;
+                MarkLodVisibilityRefreshed();
+            }
+
+            Profiler.EndSample();
+        }
+
+        void CommitLoadedRecordVisibility(SpatialLoadedSubcellRecord record)
+        {
+            if (record?.Root == null)
+                return;
+
+            ApplyRecordVisibility(GetOrBuildLodContext(), record);
+        }
+
+        void ApplyRecordVisibility(
+            SpatialStreamingLodSubstitution.Context ctx,
+            SpatialLoadedSubcellRecord record)
+        {
+            if (record?.Root == null)
+                return;
+
+            bool visible = SpatialStreamingLodSubstitution.ShouldRenderRecord(ctx, record);
+            if (_detailCrossfade != null &&
+                record.LodLevel == SpatialStreamingLodLevel.SubcellProxy &&
+                _detailCrossfade.IsTransitioningProxy(record.Key))
+            {
+                visible = true;
+            }
+
+            if (record.Root.activeSelf != visible)
+                record.Root.SetActive(visible);
+        }
+
+        void RegisterLoadedRecordIndexes(SpatialLoadedSubcellRecord record)
+        {
+            if (record?.Root == null)
+                return;
+
+            _loadedStateIndex?.RegisterLoaded(record);
+            _coverage?.OnRecordLoaded(record);
+        }
+
+        void UnregisterLoadedRecordIndexes(SpatialLoadedSubcellRecord record)
+        {
+            if (record == null)
+                return;
+
+            _loadedStateIndex?.UnregisterLoaded(record);
+            _coverage?.OnRecordUnloaded(record);
+        }
+
+        int ProcessVisibilityQueue(int maxRecords)
+        {
+            if (maxRecords <= 0 || _pendingVisibilityKeys.Count == 0 || _cam == null)
+                return 0;
+
+            Profiler.BeginSample("SpatialStreaming.ProcessVisibilityQueue");
+            SpatialStreamingLodSubstitution.Context ctx = GetOrBuildLodContext();
+
+            _visibilityQueueDrainScratch.Clear();
+            foreach (string key in _pendingVisibilityKeys)
+            {
+                _visibilityQueueDrainScratch.Add(key);
+                if (_visibilityQueueDrainScratch.Count >= maxRecords)
+                    break;
+            }
+
+            int processed = 0;
+            for (int i = 0; i < _visibilityQueueDrainScratch.Count; i++)
+            {
+                string key = _visibilityQueueDrainScratch[i];
+                if (!_pendingVisibilityKeys.Remove(key))
                     continue;
 
-                bool visible = ShouldBlockBeVisible(record);
-                if (record.Root.activeSelf != visible)
-                    record.Root.SetActive(visible);
+                if (_loaded.TryGetValue(key, out SpatialLoadedSubcellRecord record))
+                    ApplyRecordVisibility(ctx, record);
+
+                processed++;
+            }
+
+            Profiler.EndSample();
+            return processed;
+        }
+
+        void EnqueueVisibilityKey(string key)
+        {
+            if (!string.IsNullOrEmpty(key))
+                _pendingVisibilityKeys.Add(key);
+        }
+
+        void EnqueueLoadedSupertileAt(
+            int blockLeft,
+            int blockBottom,
+            SpatialStreamingLodLevel lod)
+        {
+            long packed = SpatialStreamingLodSubstitution.PackBlockOrigin(blockLeft, blockBottom);
+            IReadOnlyDictionary<long, SpatialLoadedSubcellRecord> index =
+                lod == SpatialStreamingLodLevel.Hlod4x4
+                    ? _loadedStateIndex?.Hlod4ByBlock
+                    : _loadedStateIndex?.Hlod2ByBlock;
+            if (index == null)
+                return;
+            if (index.TryGetValue(packed, out SpatialLoadedSubcellRecord record) && record != null)
+                EnqueueVisibilityKey(record.Key);
+        }
+
+        void EnqueueSupertileKeysForTile(string tileId)
+        {
+            if (_manifest == null || !SpatialTileIdUtility.TryParse(tileId, out int left, out int bottom))
+                return;
+
+            int tileSize = _manifest.TileSizeMeters > 0 ? _manifest.TileSizeMeters : 1000;
+            int block2Size = tileSize * 2;
+            int block4Size = tileSize * 4;
+            int block2Left = SpatialTileIdUtility.AlignDownMeters(left, block2Size);
+            int block2Bottom = SpatialTileIdUtility.AlignDownMeters(bottom, block2Size);
+            int block4Left = SpatialTileIdUtility.AlignDownMeters(left, block4Size);
+            int block4Bottom = SpatialTileIdUtility.AlignDownMeters(bottom, block4Size);
+
+            EnqueueLoadedSupertileAt(block2Left, block2Bottom, SpatialStreamingLodLevel.Hlod2x2);
+            EnqueueLoadedSupertileAt(block4Left, block4Bottom, SpatialStreamingLodLevel.Hlod4x4);
+        }
+
+        void EnqueueTileProxyKeysInBlock2(int block2Left, int block2Bottom)
+        {
+            if (_manifest == null)
+                return;
+
+            int tileSize = _manifest.TileSizeMeters > 0 ? _manifest.TileSizeMeters : 1000;
+            for (int dy = 0; dy < 2; dy++)
+            {
+                for (int dx = 0; dx < 2; dx++)
+                {
+                    string tileId = SpatialTileIdUtility.Format(
+                        block2Left + dx * tileSize,
+                        block2Bottom + dy * tileSize);
+                    EnqueueVisibilityKey(SpatialStreamingHlodEvaluator.BuildProxyKey(tileId));
+                }
             }
         }
 
-        bool ShouldBlockBeVisible(SpatialLoadedSubcellRecord record)
+        void EnqueueLoadedSubcellProxyVisibilityForTile(string tileId, HashSet<string> scratch)
         {
-            switch (record.LodLevel)
+            if (_manifest == null || string.IsNullOrEmpty(tileId) || scratch == null)
+                return;
+
+            SpatialTileManifestEntry tile = _manifest.FindTile(tileId);
+            if (tile?.Subcells == null)
+                return;
+
+            foreach (SpatialSubcellManifestEntry subcell in tile.Subcells)
+            {
+                if (subcell == null || string.IsNullOrEmpty(subcell.ProxyBundleRel))
+                    continue;
+
+                string proxyKey = SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tileId, subcell.SubcellId);
+                if (_loaded.ContainsKey(proxyKey))
+                    scratch.Add(proxyKey);
+            }
+        }
+
+        void EnqueueVisibilityKeysForLoad(SpatialStreamingHlodEvaluator.LoadRequest request)
+        {
+            _visibilityRefreshScratch.Clear();
+            if (!string.IsNullOrEmpty(request.Key))
+                _visibilityRefreshScratch.Add(request.Key);
+
+            switch (request.LodLevel)
             {
                 case SpatialStreamingLodLevel.Detail:
-                    return true;
-
                 case SpatialStreamingLodLevel.SubcellProxy:
-                    return !IsSubcellDetailLoaded(record.TileId, record.SubcellId);
+                    if (!string.IsNullOrEmpty(request.TileId) && !string.IsNullOrEmpty(request.SubcellId))
+                    {
+                        _visibilityRefreshScratch.Add(
+                            SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(request.TileId, request.SubcellId));
+                        _visibilityRefreshScratch.Add(
+                            SpatialStreamingHlodEvaluator.BuildDetailKey(request.TileId, request.SubcellId));
+                    }
+
+                    if (!string.IsNullOrEmpty(request.TileId))
+                    {
+                        _visibilityRefreshScratch.Add(SpatialStreamingHlodEvaluator.BuildProxyKey(request.TileId));
+                        EnqueueLoadedSubcellProxyVisibilityForTile(request.TileId, _visibilityRefreshScratch);
+                        EnqueueSupertileKeysForTile(request.TileId);
+                    }
+
+                    break;
 
                 case SpatialStreamingLodLevel.TileProxy:
-                    return !ShouldHideTileProxyForTile(record.TileId);
+                    if (!string.IsNullOrEmpty(request.TileId))
+                        EnqueueSupertileKeysForTile(request.TileId);
+                    break;
 
                 case SpatialStreamingLodLevel.Hlod2x2:
-                case SpatialStreamingLodLevel.Hlod4x4:
-                    return !IsSupertileFullySuperseded(record);
+                {
+                    int tileSize = _manifest?.TileSizeMeters > 0 ? _manifest.TileSizeMeters : 1000;
+                    int block4Size = tileSize * 4;
+                    int block4Left = SpatialTileIdUtility.AlignDownMeters(request.BlockLeft, block4Size);
+                    int block4Bottom = SpatialTileIdUtility.AlignDownMeters(request.BlockBottom, block4Size);
+                    EnqueueLoadedSupertileAt(block4Left, block4Bottom, SpatialStreamingLodLevel.Hlod4x4);
+                    EnqueueTileProxyKeysInBlock2(request.BlockLeft, request.BlockBottom);
+                    break;
+                }
 
-                default:
-                    return true;
+                case SpatialStreamingLodLevel.Hlod4x4:
+                    break;
             }
+
+            foreach (string key in _visibilityRefreshScratch)
+                EnqueueVisibilityKey(key);
         }
 
-        /// <summary>
-        /// Hide a supertile when every child tile is covered by finer LOD, or when any child
-        /// has fully swapped to detail (monolithic mesh cannot mask per-tile).
-        /// </summary>
-        bool IsSupertileFullySuperseded(SpatialLoadedSubcellRecord supertileRecord)
+        void EnqueueVisibilityKeysForDetailCommit(string tileId, string subcellId, bool crossfadeStarted)
         {
-            if (_manifest == null || _cam == null)
-                return false;
+            _visibilityRefreshScratch.Clear();
+            _visibilityRefreshScratch.Add(SpatialStreamingHlodEvaluator.BuildDetailKey(tileId, subcellId));
+            _visibilityRefreshScratch.Add(SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tileId, subcellId));
+            _visibilityRefreshScratch.Add(SpatialStreamingHlodEvaluator.BuildProxyKey(tileId));
 
-            SpatialSupertileManifestEntry entry = _manifest.FindSupertile(supertileRecord.SubcellId);
-            if (entry?.ChildTileIds == null || entry.ChildTileIds.Count == 0)
-                return false;
+            foreach (string key in _visibilityRefreshScratch)
+                EnqueueVisibilityKey(key);
 
-            Vector3 camPos = _cam.position;
-            int tileSize = _manifest.TileSizeMeters;
+            EnqueueSupertileKeysForTile(tileId);
 
-            foreach (string tileId in entry.ChildTileIds)
+            if (crossfadeStarted)
+                UpdateCrossfadeVisibility();
+        }
+
+        void UpdateCrossfadeVisibility()
+        {
+            if (_detailCrossfade == null)
+                return;
+
+            Profiler.BeginSample("SpatialStreaming.UpdateCrossfadeVisibility");
+            foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
             {
-                if (StillNeedsSupertileCoverageForTile(tileId, camPos, tileSize, supertileRecord))
-                    return false;
+                if (record?.Root == null ||
+                    record.LodLevel != SpatialStreamingLodLevel.SubcellProxy ||
+                    !_detailCrossfade.IsTransitioningProxy(record.Key))
+                {
+                    continue;
+                }
+
+                if (!record.Root.activeSelf)
+                    record.Root.SetActive(true);
             }
 
-            return true;
+            Profiler.EndSample();
+        }
+
+        void OnDetailCommitted(string tileId, string subcellId)
+        {
+            string proxyKey = SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tileId, subcellId);
+            string detailKey = SpatialStreamingHlodEvaluator.BuildDetailKey(tileId, subcellId);
+            CancelLoadRequest(proxyKey);
+
+            _loaded.TryGetValue(proxyKey, out SpatialLoadedSubcellRecord proxyRecord);
+            _loaded.TryGetValue(detailKey, out SpatialLoadedSubcellRecord detailRecord);
+
+            bool crossfadeStarted = _enableDetailCrossfade &&
+                                      _detailCrossfade != null &&
+                                      proxyRecord?.Root != null &&
+                                      detailRecord?.Root != null &&
+                                      _detailCrossfade.TryBegin(
+                                          proxyKey,
+                                          proxyRecord.Root,
+                                          detailRecord.Root,
+                                          () =>
+                                          {
+                                              if (detailRecord.Root != null)
+                                                  SpatialStreamedMeshRoot.Attach(detailRecord.Root, _gpuSettings);
+                                              UnloadBlock(proxyKey);
+                                          });
+
+            if (!crossfadeStarted)
+            {
+                if (detailRecord?.Root != null)
+                    SpatialStreamedMeshRoot.Attach(detailRecord.Root, _gpuSettings);
+                UnloadSubcellProxy(tileId, subcellId);
+            }
+
+            UnloadTileProxyIfProgressiveDetail(tileId);
+            EnqueueVisibilityKeysForDetailCommit(tileId, subcellId, crossfadeStarted);
         }
 
         void UnloadSubcellProxy(string tileId, string subcellId)
@@ -800,181 +1946,37 @@ namespace ZGConnect.SpatialStreaming
                 UnloadBlock(proxyKey);
         }
 
-        bool ShouldHideTileProxyForTile(string tileId)
-        {
-            if (string.IsNullOrEmpty(tileId))
-                return false;
-
-            SpatialTileManifestEntry tile = _manifest?.FindTile(tileId);
-            if (tile == null)
-                return IsTileDetailComplete(tileId);
-
-            if (tile.UsesSubcells)
-                return CountLoadedDetailSubcellsForTile(tileId) > 0;
-
-            return IsTileDetailComplete(tileId);
-        }
-
         void UnloadCoarseLodForTile(string tileId)
         {
             if (string.IsNullOrEmpty(tileId))
                 return;
 
             SpatialTileManifestEntry tile = _manifest?.FindTile(tileId);
+            if (tile?.Subcells == null)
+                return;
 
             string proxyKey = SpatialStreamingHlodEvaluator.BuildProxyKey(tileId);
             if (_loaded.ContainsKey(proxyKey))
                 UnloadBlock(proxyKey);
-
-            foreach (SpatialSubcellManifestEntry subcell in tile?.Subcells ?? new List<SpatialSubcellManifestEntry>())
-            {
-                if (subcell == null || string.IsNullOrEmpty(subcell.SubcellId))
-                    continue;
-
-                UnloadSubcellProxy(tileId, subcell.SubcellId);
-            }
-
-            foreach (string key in _loaded.Keys.ToList())
-            {
-                if (!_loaded.TryGetValue(key, out SpatialLoadedSubcellRecord record))
-                    continue;
-
-                if (record.LodLevel != SpatialStreamingLodLevel.Hlod2x2 &&
-                    record.LodLevel != SpatialStreamingLodLevel.Hlod4x4)
-                {
-                    continue;
-                }
-
-                SpatialSupertileManifestEntry entry = _manifest?.FindSupertile(record.SubcellId);
-                if (entry?.ChildTileIds != null && entry.ChildTileIds.Contains(tileId))
-                    UnloadBlock(key);
-            }
-        }
-
-        bool StillNeedsSupertileCoverageForTile(
-            string tileId,
-            Vector3 camPos,
-            int tileSize,
-            SpatialLoadedSubcellRecord contextSupertile)
-        {
-            SpatialTileManifestEntry tile = _manifest.FindTile(tileId);
-            if (tile == null)
-                return true;
-
-            float tileDist = SpatialTileDistanceUtility.TileBoundaryDistance(
-                camPos, tile.GetUnityPosition(), tileSize);
-
-            if (IsTileDetailComplete(tileId))
-                return false;
-
-            if (IsTileDetailLoading(tileId, tileDist) && HasProxyForTile(tileId))
-                return false;
-
-            if (IsTileCoveredByFinerLod(tileId, tileDist))
-                return false;
-
-            if (contextSupertile.LodLevel == SpatialStreamingLodLevel.Hlod4x4 &&
-                IsTileCoveredByVisibleHlod2Supertile(tileId, camPos, tileSize))
-            {
-                return false;
-            }
-
-            if (!_enableHlod || tileDist > _hlodDistances.proxyUnloadMeters)
-                return true;
-
-            return true;
-        }
-
-        bool IsTileDetailLoading(string tileId, float tileDist)
-        {
-            if (tileDist > _hlodDistances.detailLoadMeters)
-                return false;
-
-            return CountLoadedDetailSubcellsForTile(tileId) > 0 && !IsTileDetailComplete(tileId);
-        }
-
-        bool IsTileCoveredByFinerLod(string tileId, float tileDist)
-        {
-            if (IsTileDetailComplete(tileId))
-                return true;
-
-            if (IsTileDetailLoading(tileId, tileDist))
-                return HasProxyForTile(tileId);
-
-            if (tileDist <= _hlodDistances.proxyUnloadMeters && HasProxyForTile(tileId))
-                return true;
-
-            return false;
-        }
-
-        bool HasProxyForTile(string tileId)
-        {
-            if (string.IsNullOrEmpty(tileId))
-                return false;
-
-            if (_loaded.ContainsKey(SpatialStreamingHlodEvaluator.BuildProxyKey(tileId)))
-                return true;
-
-            SpatialTileManifestEntry tile = _manifest?.FindTile(tileId);
-            if (tile?.Subcells == null)
-                return false;
 
             foreach (SpatialSubcellManifestEntry subcell in tile.Subcells)
             {
                 if (subcell == null || string.IsNullOrEmpty(subcell.SubcellId))
                     continue;
 
-                if (_loaded.ContainsKey(SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tileId, subcell.SubcellId)))
-                    return true;
+                UnloadSubcellProxy(tileId, subcell.SubcellId);
             }
-
-            return false;
-        }
-
-        bool IsTileCoveredByVisibleHlod2Supertile(string tileId, Vector3 camPos, int tileSize)
-        {
-            if (!SpatialTileIdUtility.TryParse(tileId, out int left, out int bottom))
-                return false;
-
-            int tileSpan = tileSize;
-            foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
-            {
-                if (record.LodLevel != SpatialStreamingLodLevel.Hlod2x2 ||
-                    record.Root == null ||
-                    !record.Root.activeSelf)
-                {
-                    continue;
-                }
-
-                int blockSpan = tileSize * record.HlodFactor;
-                bool insideBlock = left >= record.BlockLeft &&
-                                   left + tileSpan <= record.BlockLeft + blockSpan &&
-                                   bottom >= record.BlockBottom &&
-                                   bottom + tileSpan <= record.BlockBottom + blockSpan;
-                if (!insideBlock)
-                    continue;
-
-                if (!StillNeedsSupertileCoverageForTile(tileId, camPos, tileSize, record))
-                    return true;
-            }
-
-            return false;
-        }
-
-        bool IsSubcellDetailLoaded(string tileId, string subcellId)
-        {
-            if (string.IsNullOrEmpty(tileId) || string.IsNullOrEmpty(subcellId))
-                return false;
-
-            if (subcellId == "tile_coarse")
-                return IsTileDetailComplete(tileId);
-
-            return _loaded.ContainsKey(SpatialStreamingHlodEvaluator.BuildDetailKey(tileId, subcellId));
         }
 
         bool IsTileDetailComplete(string tileId)
         {
-            if (string.IsNullOrEmpty(tileId) || _manifest == null)
+            if (string.IsNullOrEmpty(tileId))
+                return false;
+
+            if (_loadedStateIndex != null)
+                return _loadedStateIndex.IsTileDetailComplete(tileId);
+
+            if (_manifest == null)
                 return false;
 
             SpatialTileManifestEntry tile = _manifest.FindTile(tileId);
@@ -1006,6 +2008,9 @@ namespace ZGConnect.SpatialStreaming
         {
             if (string.IsNullOrEmpty(tileId))
                 return 0;
+
+            if (_loadedStateIndex != null)
+                return _loadedStateIndex.CountLoadedDetailSubcells(tileId);
 
             int count = 0;
             foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
@@ -1039,19 +2044,18 @@ namespace ZGConnect.SpatialStreaming
         public IReadOnlyList<string> BuildRuntimeHudLines()
         {
             SpatialStreamingStats stats = _stats;
-            var lines = new List<string>(16)
+            var lines = new List<string>(24)
             {
                 $"HLOD: {(_enableHlod ? "on" : "off")}",
                 $"Manifest tiles: {_manifest?.Tiles?.Count ?? 0}  supertiles: {_manifest?.Supertiles?.Count ?? 0}",
-                $"Pending: {stats.Pending}  Loading: {stats.Loading}",
-                $"Loaded total: {stats.LoadedTotal}",
-                $"  detail: {stats.LoadedDetail}  subcell proxy: {stats.LoadedSubcellProxy}  tile proxy: {stats.LoadedTileProxy}",
-                $"  hlod2x2: {stats.LoadedHlod2x2}  hlod4x4: {stats.LoadedHlod4x4}",
-                $"Visible blocks: {stats.VisibleBlocks}",
-                $"Hidden (substituted): {stats.HiddenBySubstitution}",
-                $"Instantiated (lifetime): {stats.TotalInstantiated}",
-                $"Load failures: {stats.TotalLoadFailures}",
+                $"Index tiles: {_runtimeIndex?.TileCount ?? 0}  supertiles: {_runtimeIndex?.SupertileCount ?? 0}",
             };
+
+            SpatialStreamingHudFormatting.AppendLodTable(lines, stats);
+
+            lines.Add($"Hidden (substituted): {stats.HiddenBySubstitution}");
+            lines.Add($"Instantiated (lifetime): {stats.TotalInstantiated}");
+            lines.Add($"Load failures: {stats.TotalLoadFailures}");
 
             if (!_datasetBundlesAvailable)
                 lines.Add("Dataset: bundles_spatial MISSING — run Bake");
@@ -1063,13 +2067,21 @@ namespace ZGConnect.SpatialStreaming
                 lines.Add($"Last error: {stats.LastLoadError}");
 
             lines.Add($"Visible mesh renderers: {stats.TotalMeshRenderers}");
-            lines.Add($"Detail tile: {_detailTileLoadDistanceMeters:F0} / {_detailTileUnloadDistanceMeters:F0} m");
-            lines.Add($"Proxy: {_proxyLoadDistanceMeters:F0} / {_proxyUnloadDistanceMeters:F0} m");
-            lines.Add($"HLOD2: {_hlod2LoadDistanceMeters:F0} / {_hlod2UnloadDistanceMeters:F0} m");
-            lines.Add($"HLOD4: {_hlod4LoadDistanceMeters:F0} / {_hlod4UnloadDistanceMeters:F0} m");
+            lines.Add($"Detail rings: {_tileRings.detailRings}  subcell proxy: {_tileRings.subcellProxyRings}  tile proxy: {_tileRings.tileProxyRings}");
+            lines.Add($"HLOD2 rings: {_tileRings.hlod2x2Rings}  HLOD4 rings: {_tileRings.hlod4x4Rings}");
 
-            if (_cam != null)
-                lines.Add($"Camera: {_cam.position.x:F0}, {_cam.position.y:F0}, {_cam.position.z:F0}");
+            if (_debugLodTint)
+            {
+                lines.Add("LOD tint: detail=green  subcell=cyan  tile=yellow  HLOD2=orange  HLOD4=red");
+            }
+
+            if (_manifest != null &&
+                _cam != null &&
+                SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(
+                    _manifest, _cam.position, out var cameraTile))
+            {
+                lines.Add($"Camera tile: {SpatialTileIdUtility.Format(cameraTile.Left, cameraTile.Bottom)}");
+            }
 
             if (_enablePerformanceProfiling)
             {
@@ -1116,7 +2128,16 @@ namespace ZGConnect.SpatialStreaming
                 _debugHud.Initialize(this);
             }
 
+            SyncDebugHudSettings();
             _debugHud.SetVisible(true);
+        }
+
+        void SyncDebugHudSettings()
+        {
+            if (_debugHud == null)
+                return;
+
+            _debugHud.ApplySettings(_debugHudScale);
         }
 
         string ResolveMaterialTileId(SpatialStreamingHlodEvaluator.LoadRequest request)
@@ -1160,61 +2181,95 @@ namespace ZGConnect.SpatialStreaming
 
         void RefreshStats()
         {
-            int detail = 0;
-            int subcellProxy = 0;
-            int proxy = 0;
-            int hlod2 = 0;
-            int hlod4 = 0;
-            int visible = 0;
+            MarkStatsRefreshed();
+
+            SpatialStreamingLodBandStats detail = default;
+            SpatialStreamingLodBandStats subcellProxy = default;
+            SpatialStreamingLodBandStats tileProxy = default;
+            SpatialStreamingLodBandStats hlod2 = default;
+            SpatialStreamingLodBandStats hlod4 = default;
             int renderers = 0;
+
+            foreach (SpatialStreamingHlodEvaluator.LoadRequest request in _pending)
+                IncrementBandPending(ref BandForLod(ref detail, ref subcellProxy, ref tileProxy, ref hlod2, ref hlod4, request.LodLevel));
+
+            foreach (string key in _loading)
+            {
+                if (!SpatialStreamingHlodEvaluator.TryInferLodLevelFromKey(key, _manifest, out SpatialStreamingLodLevel lodLevel))
+                    continue;
+
+                IncrementBandLoading(ref BandForLod(ref detail, ref subcellProxy, ref tileProxy, ref hlod2, ref hlod4, lodLevel));
+            }
 
             foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
             {
-                switch (record.LodLevel)
-                {
-                    case SpatialStreamingLodLevel.Detail:
-                        detail++;
-                        break;
-                    case SpatialStreamingLodLevel.SubcellProxy:
-                        subcellProxy++;
-                        break;
-                    case SpatialStreamingLodLevel.TileProxy:
-                        proxy++;
-                        break;
-                    case SpatialStreamingLodLevel.Hlod2x2:
-                        hlod2++;
-                        break;
-                    case SpatialStreamingLodLevel.Hlod4x4:
-                        hlod4++;
-                        break;
-                }
+                ref SpatialStreamingLodBandStats band =
+                    ref BandForLod(ref detail, ref subcellProxy, ref tileProxy, ref hlod2, ref hlod4, record.LodLevel);
+                band.Loaded++;
 
                 if (record.Root != null && record.Root.activeSelf)
                 {
-                    visible++;
-                    renderers += record.Root.GetComponentsInChildren<MeshRenderer>(true).Length;
+                    band.Shown++;
+                    renderers += record.MeshRendererCount;
                 }
             }
 
+            int loadedTotal = detail.Loaded + subcellProxy.Loaded + tileProxy.Loaded + hlod2.Loaded + hlod4.Loaded;
+            int visible = detail.Shown + subcellProxy.Shown + tileProxy.Shown + hlod2.Shown + hlod4.Shown;
+            int pendingTotal = detail.Pending + subcellProxy.Pending + tileProxy.Pending + hlod2.Pending + hlod4.Pending;
+            int loadingTotal = detail.Loading + subcellProxy.Loading + tileProxy.Loading + hlod2.Loading + hlod4.Loading;
+
             _stats = new SpatialStreamingStats
             {
-                Pending = _pending.Count,
-                Loading = _loading.Count,
-                LoadedTotal = _loaded.Count,
-                LoadedDetail = detail,
-                LoadedSubcellProxy = subcellProxy,
-                LoadedTileProxy = proxy,
-                LoadedHlod2x2 = hlod2,
-                LoadedHlod4x4 = hlod4,
+                Pending = pendingTotal,
+                Loading = loadingTotal,
+                LoadedTotal = loadedTotal,
+                LoadedDetail = detail.Loaded,
+                LoadedSubcellProxy = subcellProxy.Loaded,
+                LoadedTileProxy = tileProxy.Loaded,
+                LoadedHlod2x2 = hlod2.Loaded,
+                LoadedHlod4x4 = hlod4.Loaded,
                 VisibleBlocks = visible,
-                HiddenBySubstitution = _loaded.Count - visible,
+                HiddenBySubstitution = loadedTotal - visible,
                 TotalInstantiated = _totalInstantiated,
                 TotalLoadFailures = _totalLoadFailures,
                 TotalMeshRenderers = renderers,
                 BlockedByLoadFailure = _loadBlockedUntil.Count,
                 LastLoadError = _lastLoadError,
+                Detail = detail,
+                SubcellProxy = subcellProxy,
+                TileProxy = tileProxy,
+                Hlod2x2 = hlod2,
+                Hlod4x4 = hlod4,
             };
         }
+
+        static ref SpatialStreamingLodBandStats BandForLod(
+            ref SpatialStreamingLodBandStats detail,
+            ref SpatialStreamingLodBandStats subcellProxy,
+            ref SpatialStreamingLodBandStats tileProxy,
+            ref SpatialStreamingLodBandStats hlod2,
+            ref SpatialStreamingLodBandStats hlod4,
+            SpatialStreamingLodLevel lodLevel)
+        {
+            switch (lodLevel)
+            {
+                case SpatialStreamingLodLevel.SubcellProxy:
+                    return ref subcellProxy;
+                case SpatialStreamingLodLevel.TileProxy:
+                    return ref tileProxy;
+                case SpatialStreamingLodLevel.Hlod2x2:
+                    return ref hlod2;
+                case SpatialStreamingLodLevel.Hlod4x4:
+                    return ref hlod4;
+                default:
+                    return ref detail;
+            }
+        }
+
+        static void IncrementBandPending(ref SpatialStreamingLodBandStats band) => band.Pending++;
+
+        static void IncrementBandLoading(ref SpatialStreamingLodBandStats band) => band.Loading++;
 
         void PruneExpiredLoadBlocks()
         {
@@ -1241,11 +2296,12 @@ namespace ZGConnect.SpatialStreaming
             if (record.Root != null)
                 SpatialObjectUtility.Destroy(record.Root);
 
-            if (!string.IsNullOrEmpty(record.BundleFullPath))
+            if (record.Bundle != null && !string.IsNullOrEmpty(record.BundleFullPath))
                 SpatialBundleLoader.Release(record.BundleFullPath, unloadAllLoadedObjects: false);
 
+            UnregisterLoadedRecordIndexes(record);
             _loaded.Remove(key);
-            UpdateLodVisibility();
+            MarkLoadedStateDirty();
 
             if (_logStreaming)
                 Debug.Log($"[ZGConnect.Spatial] Unloaded '{key}'");
@@ -1299,6 +2355,14 @@ namespace ZGConnect.SpatialStreaming
 
         void OnDestroy()
         {
+            foreach (string key in _pendingUnloadKeys.ToList())
+            {
+                if (_loaded.ContainsKey(key))
+                    UnloadBlock(key);
+            }
+
+            _pendingUnloadKeys.Clear();
+
             foreach (string key in _loaded.Keys.ToList())
                 UnloadBlock(key);
         }
