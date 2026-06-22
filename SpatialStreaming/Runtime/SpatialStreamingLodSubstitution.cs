@@ -36,7 +36,11 @@ namespace ZGConnect.SpatialStreaming
             public bool UseScreenSpaceLodPriority;
             public float ScreenSpaceFovDegrees;
             public SpatialStreamingEvaluateSliceState EvaluateSlice;
+            public SpatialLodSubstitutionGraph SubstitutionGraph;
         }
+
+        static bool UsesSubstitutionGraph(Context ctx) =>
+            ctx.EnableHlod && ctx.SubstitutionGraph != null;
 
         public static long PackBlockOrigin(int blockLeft, int blockBottom) =>
             ((long)blockLeft << 32) | (uint)blockBottom;
@@ -138,7 +142,7 @@ namespace ZGConnect.SpatialStreaming
 
         public static bool ShouldKeepSubcellProxy(Context ctx, string tileId, string subcellId)
         {
-            if (!ctx.EnableHlod)
+            if (!ctx.EnableHlod || UsesSubstitutionGraph(ctx))
                 return false;
 
             return !IsDetailLoaded(ctx, tileId, subcellId);
@@ -206,6 +210,9 @@ namespace ZGConnect.SpatialStreaming
             if (record?.Root == null)
                 return false;
 
+            if (UsesSubstitutionGraph(ctx))
+                return ctx.SubstitutionGraph.ShouldShowRecord(record.Key);
+
             switch (record.LodLevel)
             {
                 case SpatialStreamingLodLevel.Detail:
@@ -233,6 +240,9 @@ namespace ZGConnect.SpatialStreaming
 
                     return IsDetailCoarseReadyForLoad(ctx, request);
                 case SpatialStreamingLodLevel.SubcellProxy:
+                    if (UsesSubstitutionGraph(ctx))
+                        return false;
+
                     return ShouldKeepSubcellProxyRecord(ctx, new SpatialLoadedSubcellRecord
                     {
                         Key = request.Key,
@@ -371,9 +381,10 @@ namespace ZGConnect.SpatialStreaming
 
             SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
             int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellSize = SubcellSizeMeters(ctx);
             var detailProbe = DetailBandProbeForTile(ctx, tile, forWant: true);
             return SpatialStreamingHlodHandoff.TileInExpandedTileProxyCoverage(
-                ctx.Rings, tileLeft, tileBottom, ctx.CameraTile, tileSize, forWant: true, detailProbe);
+                ctx.Rings, tileLeft, tileBottom, ctx.CameraTile, tileSize, subcellSize, forWant: true, detailProbe);
         }
 
         public static bool ShouldQueueTileProxy(Context ctx, string tileId, int tileLeft, int tileBottom)
@@ -383,9 +394,10 @@ namespace ZGConnect.SpatialStreaming
 
             SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
             int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellSize = SubcellSizeMeters(ctx);
             var detailProbe = DetailBandProbeForTile(ctx, tile, forWant: false);
             return SpatialStreamingHlodHandoff.TileInExpandedTileProxyCoverage(
-                ctx.Rings, tileLeft, tileBottom, ctx.CameraTile, tileSize, forWant: false, detailProbe);
+                ctx.Rings, tileLeft, tileBottom, ctx.CameraTile, tileSize, subcellSize, forWant: false, detailProbe);
         }
 
         public static bool ShouldWantDetail(
@@ -521,6 +533,18 @@ namespace ZGConnect.SpatialStreaming
             SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(request.TileId);
             if (tile == null)
                 return false;
+
+            if (UsesSubstitutionGraph(ctx))
+            {
+                string tileProxyKey = SpatialStreamingHlodEvaluator.BuildProxyKey(request.TileId);
+                if (string.IsNullOrEmpty(tile.CoarseBundleRel) && string.IsNullOrEmpty(tile.ProxyBundleRel))
+                    return true;
+
+                if (ctx.LoadingKeys != null && ctx.LoadingKeys.Contains(tileProxyKey))
+                    return false;
+
+                return ctx.LoadedKeys != null && ctx.LoadedKeys.Contains(tileProxyKey);
+            }
 
             SpatialSubcellManifestEntry subcell = FindSubcell(ctx, request.TileId, request.SubcellId);
             if (subcell == null)

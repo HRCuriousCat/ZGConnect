@@ -191,6 +191,7 @@ namespace ZGConnect.SpatialStreaming
                     tileBottom,
                     ctx.CameraTile,
                     tileSize,
+                    subcellSize,
                     forWant: false,
                     SpatialStreamingHlodHandoff.CreateDetailBandProbe(
                         ctx.Rings, tile, ctx.CameraSubcell, tileSize, subcellSize, forWant: false)))

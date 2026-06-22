@@ -204,6 +204,18 @@ namespace ZGConnect.SpatialStreaming
                 yield return supertile;
         }
 
+        public IEnumerable<KeyValuePair<long, SpatialSupertileManifestEntry>> EnumerateHlod4Blocks()
+        {
+            foreach (KeyValuePair<long, SpatialSupertileManifestEntry> kvp in _hlod4ByBlock)
+                yield return kvp;
+        }
+
+        public IEnumerable<KeyValuePair<long, SpatialSupertileManifestEntry>> EnumerateHlod2Blocks()
+        {
+            foreach (KeyValuePair<long, SpatialSupertileManifestEntry> kvp in _hlod2ByBlock)
+                yield return kvp;
+        }
+
         public bool TryResolveCameraTileGrid(Vector3 cameraWorldPos, out SpatialStreamingTileRingUtility.CameraTileGrid cameraTile)
         {
             cameraTile = default;

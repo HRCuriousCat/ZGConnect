@@ -124,21 +124,31 @@ namespace ZGConnect.SpatialStreaming
             bool forWant) =>
             rings.detailRings > 0 && SubcellInDetailCoverage(rings, subcellRing, forWant);
 
-        public static bool TileInSubcellProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant)
+        public static bool TileInSubcellProxyCoverage(
+            SpatialStreamingTileRings rings,
+            int tileRing,
+            int tileSizeMeters,
+            int subcellSizeMeters,
+            bool forWant)
         {
-            if (rings.subcellProxyRings <= 0 && rings.detailRings <= 0)
+            if (rings.subcellProxyRings <= 0)
                 return false;
 
-            int end = rings.tileProxyRings > 0 ? rings.TileProxyBandEnd : rings.SubcellProxyBandEnd;
+            int end = rings.SubcellProxyBandEnd(tileSizeMeters, subcellSizeMeters);
             return tileRing < end + (forWant ? 1 : 0);
         }
 
-        public static bool TileInTileProxyCoverage(SpatialStreamingTileRings rings, int tileRing, bool forWant)
+        public static bool TileInTileProxyCoverage(
+            SpatialStreamingTileRings rings,
+            int tileRing,
+            int tileSizeMeters,
+            int subcellSizeMeters,
+            bool forWant)
         {
             if (rings.tileProxyRings <= 0)
                 return false;
 
-            return tileRing < rings.TileProxyBandEnd + (forWant ? 1 : 0);
+            return tileRing < rings.TileProxyBandEnd(tileSizeMeters, subcellSizeMeters) + (forWant ? 1 : 0);
         }
 
         public static bool Block4InHlod4Coverage(
@@ -241,13 +251,15 @@ namespace ZGConnect.SpatialStreaming
         public static bool TileDirectlyTriggersOneKmLayer(
             SpatialStreamingTileRings rings,
             int tileRing,
+            int tileSizeMeters,
+            int subcellSizeMeters,
             bool anySubcellInDetailBand)
         {
             if (anySubcellInDetailBand)
                 return true;
 
-            return TileInSubcellProxyCoverage(rings, tileRing, forWant: true) ||
-                   TileInTileProxyCoverage(rings, tileRing, forWant: true);
+            return TileInSubcellProxyCoverage(rings, tileRing, tileSizeMeters, subcellSizeMeters, forWant: true) ||
+                   TileInTileProxyCoverage(rings, tileRing, tileSizeMeters, subcellSizeMeters, forWant: true);
         }
 
         public static bool Hlod2BlockHasAnyChildDirectlyTriggeringOneKm(
@@ -256,10 +268,13 @@ namespace ZGConnect.SpatialStreaming
             int block2Bottom,
             in SpatialStreamingTileRingUtility.CameraTileGrid cameraTile,
             int tileSizeMeters,
+            int subcellSizeMeters,
             System.Func<int, int, bool> anySubcellInDetailBandForTile)
         {
             if (tileSizeMeters <= 0)
                 tileSizeMeters = 1000;
+            if (subcellSizeMeters <= 0)
+                subcellSizeMeters = 250;
 
             for (int dy = 0; dy < 2; dy++)
             {
@@ -271,8 +286,11 @@ namespace ZGConnect.SpatialStreaming
                         tileLeft, tileBottom, cameraTile, tileSizeMeters);
                     bool anyDetail = anySubcellInDetailBandForTile != null &&
                                      anySubcellInDetailBandForTile(tileLeft, tileBottom);
-                    if (TileDirectlyTriggersOneKmLayer(rings, tileRing, anyDetail))
+                    if (TileDirectlyTriggersOneKmLayer(
+                            rings, tileRing, tileSizeMeters, subcellSizeMeters, anyDetail))
+                    {
                         return true;
+                    }
                 }
             }
 
@@ -285,17 +303,23 @@ namespace ZGConnect.SpatialStreaming
             int tileBottom,
             in SpatialStreamingTileRingUtility.CameraTileGrid cameraTile,
             int tileSizeMeters,
+            int subcellSizeMeters,
             bool forWant,
             System.Func<int, int, bool> anySubcellInDetailBandForTile)
         {
+            if (tileSizeMeters <= 0)
+                tileSizeMeters = 1000;
+            if (subcellSizeMeters <= 0)
+                subcellSizeMeters = 250;
+
             int tileRing = SpatialStreamingTileRingUtility.ChebyshevTileRing(
                 tileLeft, tileBottom, cameraTile, tileSizeMeters);
             bool anyDetail = anySubcellInDetailBandForTile != null &&
                              anySubcellInDetailBandForTile(tileLeft, tileBottom);
-            if (TileInTileProxyCoverage(rings, tileRing, forWant) || anyDetail)
+            if (TileInTileProxyCoverage(rings, tileRing, tileSizeMeters, subcellSizeMeters, forWant) || anyDetail)
                 return true;
 
-            if (TileInSubcellProxyCoverage(rings, tileRing, forWant))
+            if (TileInSubcellProxyCoverage(rings, tileRing, tileSizeMeters, subcellSizeMeters, forWant))
                 return true;
 
             if (rings.hlod2x2Rings <= 0)
@@ -304,7 +328,7 @@ namespace ZGConnect.SpatialStreaming
             SpatialStreamingTileRingUtility.AlignHlod2BlockOrigin(
                 tileLeft, tileBottom, tileSizeMeters, out int block2Left, out int block2Bottom);
             return Hlod2BlockHasAnyChildDirectlyTriggeringOneKm(
-                rings, block2Left, block2Bottom, cameraTile, tileSizeMeters, anySubcellInDetailBandForTile);
+                rings, block2Left, block2Bottom, cameraTile, tileSizeMeters, subcellSizeMeters, anySubcellInDetailBandForTile);
         }
 
         public static bool TileInExpandedSubcellProxyCoverage(
@@ -330,11 +354,12 @@ namespace ZGConnect.SpatialStreaming
         static System.Func<int, int, bool> BuildDetailBandProbe(
             SpatialStreamingTileRings rings,
             SpatialTileManifestEntry tile,
-            in CameraSubcellGrid cameraSubcell,
+            CameraSubcellGrid cameraSubcell,
             int tileSizeMeters,
             int subcellSizeMeters,
-            bool forWant) =>
-            (left, bottom) =>
+            bool forWant)
+        {
+            return (left, bottom) =>
             {
                 if (tile == null || !string.Equals(tile.TileId, SpatialTileIdUtility.Format(left, bottom)))
                     return false;
@@ -342,11 +367,12 @@ namespace ZGConnect.SpatialStreaming
                 return TileHasAnySubcellInDetailBand(
                     rings, tile, left, bottom, cameraSubcell, tileSizeMeters, subcellSizeMeters, forWant);
             };
+        }
 
         public static System.Func<int, int, bool> CreateDetailBandProbe(
             SpatialStreamingTileRings rings,
             SpatialTileManifestEntry tile,
-            in CameraSubcellGrid cameraSubcell,
+            CameraSubcellGrid cameraSubcell,
             int tileSizeMeters,
             int subcellSizeMeters,
             bool forWant) =>
@@ -358,15 +384,24 @@ namespace ZGConnect.SpatialStreaming
             int tileBottom,
             in SpatialStreamingTileRingUtility.CameraTileGrid cameraTile,
             int tileSizeMeters,
+            int subcellSizeMeters,
             bool forWant,
             System.Func<int, int, bool> anySubcellInDetailBandForTile)
         {
+            if (tileSizeMeters <= 0)
+                tileSizeMeters = 1000;
+            if (subcellSizeMeters <= 0)
+                subcellSizeMeters = 250;
+
             int tileRing = SpatialStreamingTileRingUtility.ChebyshevTileRing(
                 tileLeft, tileBottom, cameraTile, tileSizeMeters);
             bool anyDetail = anySubcellInDetailBandForTile != null &&
                              anySubcellInDetailBandForTile(tileLeft, tileBottom);
-            if (TileDirectlyTriggersOneKmLayer(rings, tileRing, anyDetail))
+            if (TileDirectlyTriggersOneKmLayer(
+                    rings, tileRing, tileSizeMeters, subcellSizeMeters, anyDetail))
+            {
                 return true;
+            }
 
             if (rings.hlod2x2Rings <= 0)
                 return false;
@@ -374,7 +409,7 @@ namespace ZGConnect.SpatialStreaming
             SpatialStreamingTileRingUtility.AlignHlod2BlockOrigin(
                 tileLeft, tileBottom, tileSizeMeters, out int block2Left, out int block2Bottom);
             return Hlod2BlockHasAnyChildDirectlyTriggeringOneKm(
-                rings, block2Left, block2Bottom, cameraTile, tileSizeMeters, anySubcellInDetailBandForTile);
+                rings, block2Left, block2Bottom, cameraTile, tileSizeMeters, subcellSizeMeters, anySubcellInDetailBandForTile);
         }
 
         public static bool TileHasAnySubcellInDetailBand(
@@ -427,23 +462,17 @@ namespace ZGConnect.SpatialStreaming
                     tileBottom,
                     cameraTile,
                     tileSizeMeters,
+                    subcellSizeMeters,
                     forWant,
-                    (left, bottom) => TileHasAnySubcellInDetailBand(
-                        rings,
-                        tile,
-                        left,
-                        bottom,
-                        cameraSubcell,
-                        tileSizeMeters,
-                        subcellSizeMeters,
-                        forWant)))
+                    CreateDetailBandProbe(
+                        rings, tile, cameraSubcell, tileSizeMeters, subcellSizeMeters, forWant)))
             {
                 return false;
             }
 
             int tileRing = SpatialStreamingTileRingUtility.ChebyshevTileRing(
                 tileLeft, tileBottom, cameraTile, tileSizeMeters);
-            if (TileInSubcellProxyCoverage(rings, tileRing, forWant))
+            if (TileInSubcellProxyCoverage(rings, tileRing, tileSizeMeters, subcellSizeMeters, forWant))
                 return true;
 
             return TileHasAnySubcellInDetailBand(
@@ -467,23 +496,20 @@ namespace ZGConnect.SpatialStreaming
             int block2Bottom,
             in SpatialStreamingTileRingUtility.CameraTileGrid cameraTile,
             int tileSizeMeters,
+            int subcellSizeMeters,
             System.Func<int, int, bool> anySubcellInDetailBandForTile) =>
             rings.hlod2x2Rings > 0 &&
             Hlod2BlockHasAnyChildDirectlyTriggeringOneKm(
-                rings, block2Left, block2Bottom, cameraTile, tileSizeMeters, anySubcellInDetailBandForTile);
+                rings, block2Left, block2Bottom, cameraTile, tileSizeMeters, subcellSizeMeters, anySubcellInDetailBandForTile);
 
         public static int FurthestTileRingHorizon(SpatialStreamingTileRings rings, int tileSizeMeters, int subcellSizeMeters)
         {
-            int horizon = rings.FurthestConfiguredRingEnd + 1;
-            if (rings.detailRings > 0 && subcellSizeMeters > 0 && tileSizeMeters > 0)
-            {
-                int cellsPerEdge = Mathf.Max(1, tileSizeMeters / subcellSizeMeters);
-                int detailAsTileRings = (rings.detailRings + cellsPerEdge - 1) / cellsPerEdge;
-                if (detailAsTileRings + 1 > horizon)
-                    horizon = detailAsTileRings + 1;
-            }
+            if (tileSizeMeters <= 0)
+                tileSizeMeters = 1000;
+            if (subcellSizeMeters <= 0)
+                subcellSizeMeters = 250;
 
-            return horizon;
+            return rings.FurthestConfiguredRingEnd(tileSizeMeters, subcellSizeMeters) + 1;
         }
     }
 }

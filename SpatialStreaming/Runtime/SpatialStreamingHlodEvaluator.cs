@@ -320,6 +320,9 @@ namespace ZGConnect.SpatialStreaming
             HashSet<string> loadedKeys,
             HashSet<string> pendingKeys)
         {
+            if (ctx.SubstitutionGraph != null && ctx.EnableHlod)
+                return;
+
             if (!usesSubcellProxies)
                 return;
 

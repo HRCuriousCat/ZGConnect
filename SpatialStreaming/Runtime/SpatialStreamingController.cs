@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -84,6 +85,7 @@ namespace ZGConnect.SpatialStreaming
         SpatialStreamingLoadedStateIndex _loadedStateIndex;
         SpatialStreamingCoverageRefCounts _coverage;
         SpatialStreamingHlodDag _hlodDag;
+        SpatialLodSubstitutionGraph _substitutionGraph;
         readonly SpatialStreamingEvaluateSliceState _evaluateSliceState = new();
         SpatialStreamingDebugHud _debugHud;
         readonly SpatialStreamingPerformanceTracker _performanceTracker = new();
@@ -607,6 +609,7 @@ namespace ZGConnect.SpatialStreaming
                 UseScreenSpaceLodPriority = _useScreenSpaceLodPriority,
                 ScreenSpaceFovDegrees = _screenSpaceFovDegrees,
                 EvaluateSlice = _evaluateSliceState,
+                SubstitutionGraph = _substitutionGraph,
             };
         }
 
@@ -799,6 +802,7 @@ namespace ZGConnect.SpatialStreaming
         {
             _runtimeIndex = SpatialDatasetRuntimeIndex.Build(_manifest);
             _hlodDag = SpatialStreamingHlodDag.Build(_runtimeIndex, _manifest);
+            _substitutionGraph = SpatialLodSubstitutionGraph.Build(_runtimeIndex, _manifest);
             _loadedStateIndex = new SpatialStreamingLoadedStateIndex(_runtimeIndex);
             _coverage = new SpatialStreamingCoverageRefCounts(_runtimeIndex, _loadedStateIndex, _hlodDag);
             _loadedStateIndex.RebuildFromLoaded(_loaded);
@@ -844,6 +848,12 @@ namespace ZGConnect.SpatialStreaming
             StripCoarseRequestsSupersededByDetail(_evaluateWantScratch, _pending);
             EnsureSubstitutionWant(_evaluateWantScratch);
 
+            if (_substitutionGraph != null && _enableHlod)
+            {
+                _substitutionGraph.SyncFromWantAndLoaded(_evaluateWantScratch, _loaded);
+                _substitutionGraph.MergeExpandedWantInto(_evaluateWantScratch);
+            }
+
             BeginEvaluateCleanup(_evaluateWantScratch);
 
             if (_maxResidentBlocks > 0)
@@ -879,6 +889,12 @@ namespace ZGConnect.SpatialStreaming
 
         void EnsureSubstitutionWant(HashSet<string> want)
         {
+            if (_substitutionGraph != null && _enableHlod)
+            {
+                want.RemoveWhere(static key =>
+                    !string.IsNullOrEmpty(key) && key.EndsWith("|proxy", StringComparison.Ordinal));
+            }
+
             foreach (SpatialLoadedSubcellRecord record in _loaded.Values)
             {
                 if (record == null || record.LodLevel != SpatialStreamingLodLevel.Detail)
@@ -1627,6 +1643,7 @@ namespace ZGConnect.SpatialStreaming
                 return;
 
             Profiler.BeginSample("SpatialStreaming.UpdateLodVisibility");
+            RefreshSubstitutionGraph();
             SpatialStreamingLodSubstitution.Context ctx = GetOrBuildLodContext();
 
             int processed = 0;
@@ -1653,7 +1670,17 @@ namespace ZGConnect.SpatialStreaming
             if (record?.Root == null)
                 return;
 
+            RefreshSubstitutionGraph();
             ApplyRecordVisibility(GetOrBuildLodContext(), record);
+        }
+
+        void RefreshSubstitutionGraph()
+        {
+            if (_substitutionGraph == null || !_enableHlod)
+                return;
+
+            HashSet<string> want = _wantSnapshot.Count > 0 ? _wantSnapshot : _evaluateWantScratch;
+            _substitutionGraph.SyncFromWantAndLoaded(want, _loaded);
         }
 
         void ApplyRecordVisibility(
@@ -1832,7 +1859,11 @@ namespace ZGConnect.SpatialStreaming
 
                 case SpatialStreamingLodLevel.TileProxy:
                     if (!string.IsNullOrEmpty(request.TileId))
+                    {
                         EnqueueSupertileKeysForTile(request.TileId);
+                        EnqueueLoadedSubcellProxyVisibilityForTile(request.TileId, _visibilityRefreshScratch);
+                    }
+
                     break;
 
                 case SpatialStreamingLodLevel.Hlod2x2:
