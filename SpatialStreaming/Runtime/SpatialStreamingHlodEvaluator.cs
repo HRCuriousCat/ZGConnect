@@ -49,6 +49,13 @@ namespace ZGConnect.SpatialStreaming
                     out var cameraTile))
                 return;
 
+            bool hasCameraSubcell = SpatialStreamingHlodHandoff.TryResolveCameraSubcellGrid(
+                manifest,
+                substitutionContext.RuntimeIndex,
+                camPos,
+                out var cameraSubcell,
+                out _);
+
             detailCompleteTileIds ??= new HashSet<string>();
             int tileSize = manifest.TileSizeMeters;
             int subcellSize = manifest.SubcellSizeMeters > 0 ? manifest.SubcellSizeMeters : 250;
@@ -62,6 +69,8 @@ namespace ZGConnect.SpatialStreaming
                     CameraPosition = camPos,
                     Rings = rings,
                     CameraTile = cameraTile,
+                    HasCameraSubcell = hasCameraSubcell,
+                    CameraSubcell = cameraSubcell,
                     EnableHlod = enableHlod,
                     LoadedKeys = loadedKeys,
                     LoadingKeys = loading,
@@ -73,6 +82,9 @@ namespace ZGConnect.SpatialStreaming
                 ctx.CameraPosition = camPos;
                 ctx.Rings = rings;
                 ctx.CameraTile = cameraTile;
+                ctx.HasCameraSubcell = hasCameraSubcell;
+                if (hasCameraSubcell)
+                    ctx.CameraSubcell = cameraSubcell;
                 ctx.EnableHlod = enableHlod;
                 ctx.LoadedKeys = loadedKeys;
                 ctx.LoadingKeys = loading;
@@ -196,7 +208,7 @@ namespace ZGConnect.SpatialStreaming
             HashSet<string> loadedKeys,
             HashSet<string> pendingKeys)
         {
-            int maxTileRing = rings.FurthestConfiguredRingEnd + 1;
+            int maxTileRing = SpatialStreamingHlodHandoff.FurthestTileRingHorizon(rings, tileSize, subcellSize);
 
             IReadOnlyList<SpatialTileManifestEntry> tiles = ctx.RuntimeIndex != null
                 ? ctx.RuntimeIndex.CollectTilesInRing(ctx.CameraTile, maxTileRing)
@@ -242,6 +254,8 @@ namespace ZGConnect.SpatialStreaming
                     EvaluateTileProxy(
                         ctx,
                         tile,
+                        tileLeft,
+                        tileBottom,
                         tileRing,
                         rings,
                         want,
@@ -272,6 +286,8 @@ namespace ZGConnect.SpatialStreaming
                     EvaluateSubcellsDetail(
                         ctx,
                         tile,
+                        tileLeft,
+                        tileBottom,
                         tileRing,
                         rings,
                         want,
@@ -283,7 +299,7 @@ namespace ZGConnect.SpatialStreaming
                 else
                 {
                     EvaluateMonolithicTile(
-                        ctx, tile, tileRing, rings, want, pending, loading, loadedKeys, pendingKeys);
+                        ctx, tile, tileLeft, tileBottom, tileRing, rings, want, pending, loading, loadedKeys, pendingKeys);
                 }
             }
         }
@@ -313,7 +329,7 @@ namespace ZGConnect.SpatialStreaming
                     continue;
 
                 if (!SpatialStreamingLodSubstitution.ShouldWantSubcellProxy(
-                        ctx, tile.TileId, subcell.SubcellId, tileRing, detailComplete, usesSubcellProxies))
+                        ctx, tile.TileId, subcell.SubcellId, tileLeft, tileBottom, tileRing, detailComplete, usesSubcellProxies))
                 {
                     continue;
                 }
@@ -322,7 +338,7 @@ namespace ZGConnect.SpatialStreaming
                 want.Add(proxyKey);
 
                 if (!SpatialStreamingLodSubstitution.ShouldQueueSubcellProxy(
-                        ctx, tile.TileId, subcell.SubcellId, tileRing, detailComplete, usesSubcellProxies) ||
+                        ctx, tile.TileId, subcell.SubcellId, tileLeft, tileBottom, tileRing, detailComplete, usesSubcellProxies) ||
                     SpatialStreamingLodSubstitution.IsDetailLoaded(ctx, tile.TileId, subcell.SubcellId) ||
                     loadedKeys.Contains(proxyKey) ||
                     loading.Contains(proxyKey) ||
@@ -348,6 +364,8 @@ namespace ZGConnect.SpatialStreaming
         static void EvaluateSubcellsDetail(
             SpatialStreamingLodSubstitution.Context ctx,
             SpatialTileManifestEntry tile,
+            int tileLeft,
+            int tileBottom,
             int tileRing,
             SpatialStreamingTileRings rings,
             HashSet<string> want,
@@ -363,7 +381,8 @@ namespace ZGConnect.SpatialStreaming
 
                 string detailKey = BuildDetailKey(tile.TileId, subcell.SubcellId);
 
-                if (!SpatialStreamingLodSubstitution.ShouldWantDetail(tileRing, ctx))
+                if (!SpatialStreamingLodSubstitution.ShouldWantDetail(
+                        ctx, tileLeft, tileBottom, subcell.GridX, subcell.GridY))
                     continue;
 
                 want.Add(detailKey);
@@ -375,7 +394,8 @@ namespace ZGConnect.SpatialStreaming
                     continue;
                 }
 
-                if (!SpatialStreamingLodSubstitution.ShouldQueueDetail(tileRing, ctx))
+                if (!SpatialStreamingLodSubstitution.ShouldQueueDetail(
+                        ctx, tileLeft, tileBottom, subcell.GridX, subcell.GridY))
                     continue;
 
                 var detailRequest = new LoadRequest
@@ -406,6 +426,8 @@ namespace ZGConnect.SpatialStreaming
         static void EvaluateMonolithicTile(
             SpatialStreamingLodSubstitution.Context ctx,
             SpatialTileManifestEntry tile,
+            int tileLeft,
+            int tileBottom,
             int tileRing,
             SpatialStreamingTileRings rings,
             HashSet<string> want,
@@ -414,7 +436,7 @@ namespace ZGConnect.SpatialStreaming
             HashSet<string> loadedKeys,
             HashSet<string> pendingKeys)
         {
-            if (!SpatialStreamingLodSubstitution.ShouldWantDetail(tileRing, ctx))
+            if (!SpatialStreamingLodSubstitution.TileWantsMonolithicDetail(ctx, tileLeft, tileBottom))
                 return;
 
             if (string.IsNullOrEmpty(tile.CoarseBundleRel))
@@ -425,11 +447,13 @@ namespace ZGConnect.SpatialStreaming
 
             if (loadedKeys.Contains(key) ||
                 loading.Contains(key) ||
-                pendingKeys.Contains(key) ||
-                !SpatialStreamingLodSubstitution.ShouldQueueDetail(tileRing, ctx))
+                pendingKeys.Contains(key))
             {
                 return;
             }
+
+            if (!SpatialStreamingLodSubstitution.TileQueuesMonolithicDetail(ctx, tileLeft, tileBottom))
+                return;
 
             TryQueuePendingLoad(ctx, new LoadRequest
             {
@@ -445,6 +469,8 @@ namespace ZGConnect.SpatialStreaming
         static void EvaluateTileProxy(
             SpatialStreamingLodSubstitution.Context ctx,
             SpatialTileManifestEntry tile,
+            int tileLeft,
+            int tileBottom,
             int tileRing,
             SpatialStreamingTileRings rings,
             HashSet<string> want,
@@ -457,10 +483,10 @@ namespace ZGConnect.SpatialStreaming
                 return;
 
             string proxyKey = BuildProxyKey(tile.TileId);
-            if (SpatialStreamingLodSubstitution.ShouldWantTileProxy(ctx, tile.TileId, tileRing))
+            if (SpatialStreamingLodSubstitution.ShouldWantTileProxy(ctx, tile.TileId, tileLeft, tileBottom))
                 want.Add(proxyKey);
 
-            if (!SpatialStreamingLodSubstitution.ShouldQueueTileProxy(ctx, tile.TileId, tileRing) ||
+            if (!SpatialStreamingLodSubstitution.ShouldQueueTileProxy(ctx, tile.TileId, tileLeft, tileBottom) ||
                 loadedKeys.Contains(proxyKey) ||
                 loading.Contains(proxyKey) ||
                 pendingKeys.Contains(proxyKey))

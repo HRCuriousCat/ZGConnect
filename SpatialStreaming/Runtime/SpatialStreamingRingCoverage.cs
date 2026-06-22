@@ -66,11 +66,27 @@ namespace ZGConnect.SpatialStreaming
             if (IsParentHlod2StillRenderingForTile(ctx, tileId))
                 return false;
 
-            int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId);
-            if (!SpatialStreamingTileRingUtility.TileInTileProxyCoverage(ctx.Rings, tileRing, forWant: true))
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            if (!SpatialTileIdUtility.TryParse(tileId, out int tileLeft, out int tileBottom))
                 return false;
 
             SpatialTileManifestEntry tile = ctx.Manifest.FindTile(tileId);
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellSize = ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250;
+            if (!ctx.HasCameraSubcell ||
+                !SpatialStreamingHlodHandoff.TileInExpandedTileProxyCoverage(
+                    ctx.Rings,
+                    tileLeft,
+                    tileBottom,
+                    ctx.CameraTile,
+                    tileSize,
+                    forWant: true,
+                    SpatialStreamingHlodHandoff.CreateDetailBandProbe(
+                        ctx.Rings, tile, ctx.CameraSubcell, tileSize, subcellSize, forWant: true)))
+            {
+                return false;
+            }
+
             if (tile == null)
                 return true;
 
@@ -94,9 +110,23 @@ namespace ZGConnect.SpatialStreaming
             if (IsParentHlod2StillRenderingForTile(ctx, tileId))
                 return false;
 
-            int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId);
-            if (!SpatialStreamingTileRingUtility.TileInSubcellProxyCoverage(ctx.Rings, tileRing, forWant: true) &&
-                !SpatialStreamingTileRingUtility.TileInDetailCoverage(ctx.Rings, tileRing, forWant: true))
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            if (!SpatialTileIdUtility.TryParse(tileId, out int tileLeft, out int tileBottom))
+                return false;
+
+            SpatialTileManifestEntry tile = ctx.Manifest.FindTile(tileId);
+            int subcellSize = ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250;
+            if (!ctx.HasCameraSubcell ||
+                !SpatialStreamingHlodHandoff.TileWantsFullSubcellProxySet(
+                    ctx.Rings,
+                    tile,
+                    tileLeft,
+                    tileBottom,
+                    ctx.CameraTile,
+                    ctx.CameraSubcell,
+                    tileSize,
+                    subcellSize,
+                    forWant: true))
             {
                 return false;
             }
@@ -105,7 +135,8 @@ namespace ZGConnect.SpatialStreaming
         }
 
         /// <summary>
-        /// HLOD2 is a monolithic 2×2 km block — finer 1 km layers must not draw until it hands off.
+        /// HLOD2 is a monolithic 2×2 km block. Finer 1 km draws stay suppressed until the full block
+        /// handoff completes when any child tile triggered an expanded fine-tier load.
         /// </summary>
         public static bool IsParentHlod2StillRenderingForTile(
             SpatialStreamingLodSubstitution.Context ctx,
@@ -124,9 +155,7 @@ namespace ZGConnect.SpatialStreaming
             if (!SpatialTileIdUtility.TryParse(tileId, out int left, out int bottom))
                 return false;
 
-            int block2Size = tileSize * 2;
-            int block2Left = SpatialTileIdUtility.AlignDownMeters(left, block2Size);
-            int block2Bottom = SpatialTileIdUtility.AlignDownMeters(bottom, block2Size);
+            SpatialStreamingTileRingUtility.AlignHlod2BlockOrigin(left, bottom, tileSize, out int block2Left, out int block2Bottom);
 
             if (!TryGetLoadedSupertileAt(
                     ctx,
@@ -139,20 +168,60 @@ namespace ZGConnect.SpatialStreaming
                 return false;
             }
 
-            if (!ShouldRenderHlod2(ctx, hlod2))
-                return false;
-
-            return true;
+            return ShouldRenderHlod2(ctx, hlod2);
         }
 
-        static bool TileRequiresFineOneKmSubstitution(SpatialStreamingLodSubstitution.Context ctx, int tileRing)
+        static bool TileRequiresFineOneKmSubstitution(
+            SpatialStreamingLodSubstitution.Context ctx,
+            string tileId,
+            int tileLeft,
+            int tileBottom)
         {
             if (!ctx.Rings.UsesCoarseLodChain)
                 return false;
 
-            return SpatialStreamingTileRingUtility.TileInDetailCoverage(ctx.Rings, tileRing, forWant: true) ||
-                   SpatialStreamingTileRingUtility.TileInSubcellProxyCoverage(ctx.Rings, tileRing, forWant: true) ||
-                   SpatialStreamingTileRingUtility.TileInTileProxyCoverage(ctx.Rings, tileRing, forWant: true);
+            SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            var detailProbe = ctx.HasCameraSubcell
+                ? SpatialStreamingHlodHandoff.CreateDetailBandProbe(
+                    ctx.Rings,
+                    tile,
+                    ctx.CameraSubcell,
+                    tileSize,
+                    ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250,
+                    forWant: true)
+                : null;
+
+            int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId);
+            bool anyDetail = detailProbe != null && detailProbe(tileLeft, tileBottom);
+            return SpatialStreamingHlodHandoff.TileDirectlyTriggersOneKmLayer(ctx.Rings, tileRing, anyDetail);
+        }
+
+        static System.Func<int, int, bool> DetailBandProbeForBlock(
+            SpatialStreamingLodSubstitution.Context ctx,
+            int block2Left,
+            int block2Bottom,
+            int tileSizeMeters)
+        {
+            if (!ctx.HasCameraSubcell)
+                return null;
+
+            int subcellSize = ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250;
+            return (left, bottom) =>
+            {
+                string tileId = SpatialTileIdUtility.Format(left, bottom);
+                SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
+                return tile != null &&
+                       SpatialStreamingHlodHandoff.TileHasAnySubcellInDetailBand(
+                           ctx.Rings,
+                           tile,
+                           left,
+                           bottom,
+                           ctx.CameraSubcell,
+                           tileSizeMeters,
+                           subcellSize,
+                           forWant: true);
+            };
         }
 
         static bool TileOneKmLayerReadyStrict(
@@ -182,6 +251,10 @@ namespace ZGConnect.SpatialStreaming
                 return false;
 
             int block2Size = tileSizeMeters * 2;
+            int horizon = SpatialStreamingHlodHandoff.FurthestTileRingHorizon(
+                ctx.Rings, tileSizeMeters, ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250);
+            bool monolithicHlod2 = SpatialStreamingHlodHandoff.Hlod4BlockRequiresMonolithicHlod2Handoff(
+                ctx.Rings, block4Left, block4Bottom, ctx.CameraTile, tileSizeMeters);
             bool anyParticipatingChild = false;
             for (int dy = 0; dy < 2; dy++)
             {
@@ -189,20 +262,17 @@ namespace ZGConnect.SpatialStreaming
                 {
                     int childLeft = block4Left + dx * block2Size;
                     int childBottom = block4Bottom + dy * block2Size;
-                    if (!SpatialStreamingTileRingUtility.SupertileInCoverage(
-                            ctx.Rings,
-                            childLeft,
-                            childBottom,
-                            ctx.CameraTile,
-                            tileSizeMeters,
-                            factor: 2,
-                            forWant: false))
-                    {
+                    if (!ChildBlockHasTileWithinHorizon(ctx, childLeft, childBottom, tileSizeMeters, horizon))
                         continue;
-                    }
 
                     anyParticipatingChild = true;
-                    if (!Hlod2BlockReadyToReplaceHlod4(ctx, childLeft, childBottom, tileSizeMeters))
+                    bool childNeedsHlod2 = monolithicHlod2 ||
+                        SpatialStreamingHlodHandoff.Block2DirectlyInHlod2Coverage(
+                            ctx.Rings, childLeft, childBottom, ctx.CameraTile, tileSizeMeters, forWant: true);
+                    if (!childNeedsHlod2)
+                        continue;
+
+                    if (!Hlod2BlockReadyToReplaceHlod4(ctx, childLeft, childBottom, tileSizeMeters, forceRequiresHlod2: monolithicHlod2))
                         return false;
                 }
             }
@@ -219,7 +289,12 @@ namespace ZGConnect.SpatialStreaming
             if (ctx.Manifest == null || tileSizeMeters <= 0)
                 return false;
 
-            bool anyParticipant = false;
+            int horizon = SpatialStreamingHlodHandoff.FurthestTileRingHorizon(
+                ctx.Rings, tileSizeMeters, ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250);
+            var detailProbe = DetailBandProbeForBlock(ctx, block2Left, block2Bottom, tileSizeMeters);
+            bool monolithicHandoff = SpatialStreamingHlodHandoff.Hlod2BlockRequiresMonolithicOneKmHandoff(
+                ctx.Rings, block2Left, block2Bottom, ctx.CameraTile, tileSizeMeters, detailProbe);
+            bool anyInScope = false;
             for (int dy = 0; dy < 2; dy++)
             {
                 for (int dx = 0; dx < 2; dx++)
@@ -228,24 +303,49 @@ namespace ZGConnect.SpatialStreaming
                     int tileBottom = block2Bottom + dy * tileSizeMeters;
                     string tileId = SpatialTileIdUtility.Format(tileLeft, tileBottom);
                     int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId);
-                    if (!TileRequiresFineOneKmSubstitution(ctx, tileRing))
+                    if (tileRing >= horizon)
                         continue;
 
-                    anyParticipant = true;
-                    if (!TileOneKmLayerReadyStrict(ctx, tileId))
+                    anyInScope = true;
+
+                    if (monolithicHandoff)
+                    {
+                        if (!TileOneKmLayerReadyStrict(ctx, tileId))
+                            return false;
+                        continue;
+                    }
+
+                    if (TileRequiresFineOneKmSubstitution(ctx, tileId, tileLeft, tileBottom))
+                    {
+                        if (!TileOneKmLayerReadyStrict(ctx, tileId))
+                            return false;
+                    }
+                    else if (SpatialStreamingHlodHandoff.Block2DirectlyInHlod2Coverage(
+                                 ctx.Rings, block2Left, block2Bottom, ctx.CameraTile, tileSizeMeters, forWant: true))
+                    {
                         return false;
+                    }
                 }
             }
 
-            return anyParticipant;
+            return anyInScope;
         }
 
         static bool Hlod2BlockReadyToReplaceHlod4(
             SpatialStreamingLodSubstitution.Context ctx,
             int block2Left,
             int block2Bottom,
-            int tileSizeMeters)
+            int tileSizeMeters,
+            bool forceRequiresHlod2 = false)
         {
+            int horizon = SpatialStreamingHlodHandoff.FurthestTileRingHorizon(
+                ctx.Rings, tileSizeMeters, ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250);
+            if (!forceRequiresHlod2 &&
+                !ChildBlockNeedsHlod2Representation(ctx, block2Left, block2Bottom, tileSizeMeters, horizon))
+            {
+                return true;
+            }
+
             if (Hlod2BlockFullyCoveredByOneKm(ctx, block2Left, block2Bottom, tileSizeMeters))
                 return true;
 
@@ -257,6 +357,71 @@ namespace ZGConnect.SpatialStreaming
             }
 
             return ShouldRenderHlod2(ctx, hlod2);
+        }
+
+        static bool ChildBlockNeedsHlod2Representation(
+            SpatialStreamingLodSubstitution.Context ctx,
+            int blockLeft,
+            int blockBottom,
+            int tileSizeMeters,
+            int horizon)
+        {
+            var detailProbe = DetailBandProbeForBlock(ctx, blockLeft, blockBottom, tileSizeMeters);
+            if (SpatialStreamingHlodHandoff.Hlod2BlockRequiresMonolithicOneKmHandoff(
+                    ctx.Rings, blockLeft, blockBottom, ctx.CameraTile, tileSizeMeters, detailProbe))
+            {
+                return ChildBlockHasTileWithinHorizon(ctx, blockLeft, blockBottom, tileSizeMeters, horizon) &&
+                       !Hlod2BlockFullyCoveredByOneKm(ctx, blockLeft, blockBottom, tileSizeMeters);
+            }
+
+            for (int dy = 0; dy < 2; dy++)
+            {
+                for (int dx = 0; dx < 2; dx++)
+                {
+                    int tileLeft = blockLeft + dx * tileSizeMeters;
+                    int tileBottom = blockBottom + dy * tileSizeMeters;
+                    string tileId = SpatialTileIdUtility.Format(tileLeft, tileBottom);
+                    int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId);
+                    if (tileRing >= horizon)
+                        continue;
+
+                    if (TileRequiresFineOneKmSubstitution(ctx, tileId, tileLeft, tileBottom) &&
+                        !TileOneKmLayerReadyStrict(ctx, tileId))
+                    {
+                        return true;
+                    }
+
+                    if (SpatialStreamingHlodHandoff.Block2DirectlyInHlod2Coverage(
+                            ctx.Rings, blockLeft, blockBottom, ctx.CameraTile, tileSizeMeters, forWant: true))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        static bool ChildBlockHasTileWithinHorizon(
+            SpatialStreamingLodSubstitution.Context ctx,
+            int blockLeft,
+            int blockBottom,
+            int tileSizeMeters,
+            int horizon)
+        {
+            for (int dy = 0; dy < 2; dy++)
+            {
+                for (int dx = 0; dx < 2; dx++)
+                {
+                    int tileLeft = blockLeft + dx * tileSizeMeters;
+                    int tileBottom = blockBottom + dy * tileSizeMeters;
+                    string tileId = SpatialTileIdUtility.Format(tileLeft, tileBottom);
+                    if (SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId) < horizon)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         public static bool IsHlod2BlockReadyToReplaceHlod4(
@@ -272,7 +437,7 @@ namespace ZGConnect.SpatialStreaming
             int tileSizeMeters)
         {
             int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tileId);
-            if (!SpatialStreamingTileRingUtility.TileInTileProxyCoverage(ctx.Rings, tileRing, forWant: true))
+            if (!SpatialStreamingHlodHandoff.TileInTileProxyCoverage(ctx.Rings, tileRing, forWant: true))
                 return true;
 
             SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
@@ -288,7 +453,7 @@ namespace ZGConnect.SpatialStreaming
             if (TileSubcellLayerReady(ctx, tile))
                 return true;
 
-            if (!SpatialStreamingTileRingUtility.TileInSubcellProxyCoverage(ctx.Rings, tileRing, forWant: true))
+            if (!SpatialStreamingHlodHandoff.TileInSubcellProxyCoverage(ctx.Rings, tileRing, forWant: true))
             {
                 return HasLoadedTileProxy(ctx, tileId) ||
                        SpatialStreamingLodSubstitution.IsTileDetailCompletePublic(ctx, tileId);

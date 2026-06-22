@@ -30,6 +30,8 @@ namespace ZGConnect.SpatialStreaming
             SpatialStreamingLodSubstitution.Context ctx,
             SpatialTileManifestEntry tile,
             SpatialSubcellManifestEntry subcell,
+            int tileLeft,
+            int tileBottom,
             int tileRing,
             bool usesSubcellProxies,
             List<DetailSlot> into)
@@ -40,7 +42,8 @@ namespace ZGConnect.SpatialStreaming
             if (string.IsNullOrEmpty(subcell.BundleRel))
                 return;
 
-            if (!SpatialStreamingLodSubstitution.ShouldQueueDetail(tileRing, ctx))
+            if (!SpatialStreamingLodSubstitution.ShouldQueueDetail(
+                    ctx, tileLeft, tileBottom, subcell.GridX, subcell.GridY))
                 return;
 
             if (SpatialStreamingLodSubstitution.IsDetailLoaded(ctx, tile.TileId, subcell.SubcellId))
@@ -131,13 +134,27 @@ namespace ZGConnect.SpatialStreaming
             if (!ctx.EnableHlod || tile == null || !ctx.Rings.UsesCoarseLodChain)
                 return false;
 
-            int tileRing = SpatialStreamingLodSubstitution.GetTileRing(ctx, tile.TileId);
+            if (!SpatialTileIdUtility.TryParse(tile.TileId, out int tileLeft, out int tileBottom))
+                return false;
+
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellSize = ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250;
 
             if (usesSubcellProxies &&
                 subcell != null &&
                 !string.IsNullOrEmpty(subcell.ProxyBundleRel) &&
-                ctx.Rings.subcellProxyRings > 0 &&
-                SpatialStreamingTileRingUtility.TileInDetailCoverage(ctx.Rings, tileRing, forWant: false))
+                ctx.HasCameraSubcell &&
+                SpatialStreamingHlodHandoff.ShouldWantDetailForSubcell(
+                    ctx.Rings,
+                    SpatialStreamingHlodHandoff.GetSubcellRing(
+                        tileLeft,
+                        tileBottom,
+                        subcell.GridX,
+                        subcell.GridY,
+                        ctx.CameraSubcell,
+                        tileSize,
+                        subcellSize),
+                    forWant: false))
             {
                 coarseKey = SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tile.TileId, subcell.SubcellId);
                 coarseLod = SpatialStreamingLodLevel.SubcellProxy;
@@ -148,8 +165,17 @@ namespace ZGConnect.SpatialStreaming
                 subcell != null &&
                 !string.IsNullOrEmpty(subcell.ProxyBundleRel) &&
                 ctx.Rings.subcellProxyRings > 0 &&
-                tileRing >= ctx.Rings.SubcellProxyBandStart &&
-                SpatialStreamingTileRingUtility.TileInSubcellProxyCoverage(ctx.Rings, tileRing, forWant: false))
+                ctx.HasCameraSubcell &&
+                SpatialStreamingHlodHandoff.TileWantsFullSubcellProxySet(
+                    ctx.Rings,
+                    tile,
+                    tileLeft,
+                    tileBottom,
+                    ctx.CameraTile,
+                    ctx.CameraSubcell,
+                    tileSize,
+                    subcellSize,
+                    forWant: false))
             {
                 coarseKey = SpatialStreamingHlodEvaluator.BuildSubcellProxyKey(tile.TileId, subcell.SubcellId);
                 coarseLod = SpatialStreamingLodLevel.SubcellProxy;
@@ -159,8 +185,15 @@ namespace ZGConnect.SpatialStreaming
             if (!usesSubcellProxies &&
                 !string.IsNullOrEmpty(tile.ProxyBundleRel) &&
                 ctx.Rings.tileProxyRings > 0 &&
-                tileRing >= ctx.Rings.TileProxyBandStart &&
-                SpatialStreamingTileRingUtility.TileInTileProxyCoverage(ctx.Rings, tileRing, forWant: false))
+                SpatialStreamingHlodHandoff.TileInExpandedTileProxyCoverage(
+                    ctx.Rings,
+                    tileLeft,
+                    tileBottom,
+                    ctx.CameraTile,
+                    tileSize,
+                    forWant: false,
+                    SpatialStreamingHlodHandoff.CreateDetailBandProbe(
+                        ctx.Rings, tile, ctx.CameraSubcell, tileSize, subcellSize, forWant: false)))
             {
                 coarseKey = SpatialStreamingHlodEvaluator.BuildProxyKey(tile.TileId);
                 coarseLod = SpatialStreamingLodLevel.TileProxy;

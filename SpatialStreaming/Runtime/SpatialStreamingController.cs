@@ -21,15 +21,15 @@ namespace ZGConnect.SpatialStreaming
         [SerializeField] bool _enableHlod = true;
 
         [Header("LOD tile rings")]
-        [Tooltip("Square of 1 km tiles with full detail. 1 = camera tile only, 2 = 3×3. 0 = skip.")]
+        [Tooltip("Square of 250 m subcells with full detail around the camera. 1 = camera subcell only, 2 = 3×3. 0 = skip.")]
         [SerializeField] int _detailRings = 2;
-        [Tooltip("Exclusive tile rings outside detail — sub-cell footprint proxies. 0 = skip.")]
+        [Tooltip("Cumulative 1 km tile rings outside the detail band for sub-cell proxies. 0 = skip.")]
         [SerializeField] int _subcellProxyRings = 2;
-        [Tooltip("Exclusive tile rings outside sub-cell proxy band — full tile proxies. 0 = skip.")]
+        [Tooltip("Cumulative 1 km tile rings outside the sub-cell band for full tile proxies. 0 = skip.")]
         [SerializeField] int _tileProxyRings = 2;
-        [Tooltip("Exclusive 1 km tile rings outside the tile-proxy band for HLOD2 (2×2 km blocks). 0 = skip.")]
+        [Tooltip("Cumulative 2×2 km block rings outside finer bands for HLOD2. 0 = skip.")]
         [SerializeField] int _hlod2x2Rings = 3;
-        [Tooltip("Exclusive 1 km tile rings outside the HLOD2 band for HLOD4 (4×4 km blocks). 0 = skip.")]
+        [Tooltip("Cumulative 4×4 km block rings — base HLOD layer filling the view. 0 = skip.")]
         [SerializeField] int _hlod4x4Rings = 5;
 
         [Header("Streaming")]
@@ -558,13 +558,24 @@ namespace ZGConnect.SpatialStreaming
         {
             Vector3 camPos = _cam != null ? _cam.position : Vector3.zero;
             var cameraTile = default(SpatialStreamingTileRingUtility.CameraTileGrid);
+            var cameraSubcell = default(SpatialStreamingHlodHandoff.CameraSubcellGrid);
+            bool hasCameraSubcell = false;
             if (_manifest != null)
             {
-                SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(
+                hasCameraSubcell = SpatialStreamingHlodHandoff.TryResolveCameraSubcellGrid(
                     _manifest,
                     _runtimeIndex,
                     camPos,
+                    out cameraSubcell,
                     out cameraTile);
+                if (!hasCameraSubcell)
+                {
+                    SpatialStreamingTileRingUtility.TryResolveCameraTileGrid(
+                        _manifest,
+                        _runtimeIndex,
+                        camPos,
+                        out cameraTile);
+                }
             }
 
             _loadedKeysScratch.Clear();
@@ -585,6 +596,8 @@ namespace ZGConnect.SpatialStreaming
                 CameraPosition = camPos,
                 Rings = _tileRings,
                 CameraTile = cameraTile,
+                HasCameraSubcell = hasCameraSubcell,
+                CameraSubcell = cameraSubcell,
                 EnableHlod = _enableHlod,
                 LoadedKeys = _loadedKeysScratch,
                 LoadingKeys = _loading,
@@ -619,7 +632,10 @@ namespace ZGConnect.SpatialStreaming
                 return _detailCompleteTileIdsCache;
             }
 
-            int maxRing = _tileRings.FurthestConfiguredRingEnd + 1;
+            int maxRing = SpatialStreamingHlodHandoff.FurthestTileRingHorizon(
+                _tileRings,
+                _manifest.TileSizeMeters > 0 ? _manifest.TileSizeMeters : 1000,
+                _manifest.SubcellSizeMeters > 0 ? _manifest.SubcellSizeMeters : 250);
 
             IEnumerable<SpatialTileManifestEntry> tiles = _runtimeIndex != null
                 ? _runtimeIndex.CollectTilesInRing(cameraTile, maxRing + 1)
@@ -1302,7 +1318,6 @@ namespace ZGConnect.SpatialStreaming
 
             Vector3 worldPos = ResolveInstanceWorldPosition(request);
             bool isProxyLod = IsProxyLod(request.LodLevel);
-            bool isSupertileLod = IsSupertileLod(request.LodLevel);
             GameObject instance = null;
 
             if (loadResult.MeshDetail != null)
@@ -1348,9 +1363,6 @@ namespace ZGConnect.SpatialStreaming
             {
                 instance.name = BuildInstanceName(request);
 
-                bool isCoarseProxy = request.LodLevel == SpatialStreamingLodLevel.TileProxy ||
-                                     request.LodLevel == SpatialStreamingLodLevel.SubcellProxy;
-
                 bool deferGpuAttachForCrossfade = request.LodLevel == SpatialStreamingLodLevel.Detail &&
                                                   _enableDetailCrossfade &&
                                                   _detailCrossfade != null &&
@@ -1378,7 +1390,7 @@ namespace ZGConnect.SpatialStreaming
                     spawnMainThreadMs += MarkMainThread() - materialsStart;
                 }
 
-                if (!isCoarseProxy && !isSupertileLod && !deferGpuAttachForCrossfade)
+                if (!isProxyLod && !deferGpuAttachForCrossfade)
                 {
                     yield return SpatialSpawnFrameBudget.WaitForSpawnStep(_loadBudget);
 
@@ -1458,10 +1470,6 @@ namespace ZGConnect.SpatialStreaming
                 SpatialSpawnFrameBudget.ReleaseFinalizeSlot();
             }
         }
-
-        static bool IsSupertileLod(SpatialStreamingLodLevel lodLevel) =>
-            lodLevel == SpatialStreamingLodLevel.Hlod2x2 ||
-            lodLevel == SpatialStreamingLodLevel.Hlod4x4;
 
         static bool IsProxyLod(SpatialStreamingLodLevel lodLevel) =>
             lodLevel == SpatialStreamingLodLevel.SubcellProxy ||
@@ -2067,7 +2075,7 @@ namespace ZGConnect.SpatialStreaming
                 lines.Add($"Last error: {stats.LastLoadError}");
 
             lines.Add($"Visible mesh renderers: {stats.TotalMeshRenderers}");
-            lines.Add($"Detail rings: {_tileRings.detailRings}  subcell proxy: {_tileRings.subcellProxyRings}  tile proxy: {_tileRings.tileProxyRings}");
+            lines.Add($"Detail rings (250 m): {_tileRings.detailRings}  subcell proxy: {_tileRings.subcellProxyRings}  tile proxy: {_tileRings.tileProxyRings}");
             lines.Add($"HLOD2 rings: {_tileRings.hlod2x2Rings}  HLOD4 rings: {_tileRings.hlod4x4Rings}");
 
             if (_debugLodTint)

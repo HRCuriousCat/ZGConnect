@@ -25,6 +25,8 @@ namespace ZGConnect.SpatialStreaming
             public Vector3 CameraPosition;
             public SpatialStreamingTileRings Rings;
             public SpatialStreamingTileRingUtility.CameraTileGrid CameraTile;
+            public SpatialStreamingHlodHandoff.CameraSubcellGrid CameraSubcell;
+            public bool HasCameraSubcell;
             public bool EnableHlod;
             public HashSet<string> LoadedKeys;
             public HashSet<string> LoadingKeys;
@@ -207,13 +209,6 @@ namespace ZGConnect.SpatialStreaming
             switch (record.LodLevel)
             {
                 case SpatialStreamingLodLevel.Detail:
-                    if (ctx.Rings.UsesCoarseLodChain &&
-                        !string.IsNullOrEmpty(record.TileId) &&
-                        SpatialStreamingRingCoverage.IsParentHlod2StillRenderingForTile(ctx, record.TileId))
-                    {
-                        return false;
-                    }
-
                     return true;
                 case SpatialStreamingLodLevel.SubcellProxy:
                     return ShouldRenderSubcellProxyRecord(ctx, record);
@@ -284,26 +279,30 @@ namespace ZGConnect.SpatialStreaming
             };
         }
 
+        static int SubcellSizeMeters(Context ctx) =>
+            ctx.Manifest?.SubcellSizeMeters > 0 ? ctx.Manifest.SubcellSizeMeters : 250;
+
+        static System.Func<int, int, bool> DetailBandProbeForTile(Context ctx, SpatialTileManifestEntry tile, bool forWant)
+        {
+            if (!ctx.HasCameraSubcell || tile == null)
+                return null;
+
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            return SpatialStreamingHlodHandoff.CreateDetailBandProbe(
+                ctx.Rings,
+                tile,
+                ctx.CameraSubcell,
+                tileSize,
+                SubcellSizeMeters(ctx),
+                forWant);
+        }
+
         public static bool ShouldWantSubcellProxy(
             Context ctx,
             string tileId,
             string subcellId,
-            int tileRing,
-            bool detailCompleteForTile,
-            bool usesSubcellProxies)
-        {
-            return ShouldQueueSubcellProxy(ctx, tileId, subcellId, tileRing, detailCompleteForTile, usesSubcellProxies) ||
-                   (ctx.EnableHlod &&
-                    !detailCompleteForTile &&
-                    usesSubcellProxies &&
-                    !IsDetailLoaded(ctx, tileId, subcellId) &&
-                    SpatialStreamingTileRingUtility.ShouldWantSubcellProxy(ctx.Rings, tileRing));
-        }
-
-        public static bool ShouldQueueSubcellProxy(
-            Context ctx,
-            string tileId,
-            string subcellId,
+            int tileLeft,
+            int tileBottom,
             int tileRing,
             bool detailCompleteForTile,
             bool usesSubcellProxies)
@@ -314,35 +313,176 @@ namespace ZGConnect.SpatialStreaming
             if (string.IsNullOrEmpty(subcellId))
                 return false;
 
-            if (!SpatialStreamingTileRingUtility.ShouldQueueSubcellProxy(ctx.Rings, tileRing))
+            SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
+            if (tile == null || !ctx.HasCameraSubcell)
                 return false;
 
-            return !IsDetailLoaded(ctx, tileId, subcellId);
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            return SpatialStreamingHlodHandoff.TileWantsFullSubcellProxySet(
+                       ctx.Rings,
+                       tile,
+                       tileLeft,
+                       tileBottom,
+                       ctx.CameraTile,
+                       ctx.CameraSubcell,
+                       tileSize,
+                       SubcellSizeMeters(ctx),
+                       forWant: true) &&
+                   !IsDetailLoaded(ctx, tileId, subcellId);
         }
 
-        public static bool ShouldWantTileProxy(Context ctx, string tileId, int tileRing)
+        public static bool ShouldQueueSubcellProxy(
+            Context ctx,
+            string tileId,
+            string subcellId,
+            int tileLeft,
+            int tileBottom,
+            int tileRing,
+            bool detailCompleteForTile,
+            bool usesSubcellProxies)
+        {
+            if (!ShouldWantSubcellProxy(
+                    ctx, tileId, subcellId, tileLeft, tileBottom, tileRing, detailCompleteForTile, usesSubcellProxies))
+            {
+                return false;
+            }
+
+            SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
+            if (tile == null || !ctx.HasCameraSubcell)
+                return false;
+
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            return SpatialStreamingHlodHandoff.TileWantsFullSubcellProxySet(
+                ctx.Rings,
+                tile,
+                tileLeft,
+                tileBottom,
+                ctx.CameraTile,
+                ctx.CameraSubcell,
+                tileSize,
+                SubcellSizeMeters(ctx),
+                forWant: false);
+        }
+
+        public static bool ShouldWantTileProxy(Context ctx, string tileId, int tileLeft, int tileBottom)
         {
             if (!ShouldKeepTileProxy(ctx, tileId))
                 return false;
 
-            return SpatialStreamingTileRingUtility.ShouldWantTileProxy(ctx.Rings, tileRing);
+            SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            var detailProbe = DetailBandProbeForTile(ctx, tile, forWant: true);
+            return SpatialStreamingHlodHandoff.TileInExpandedTileProxyCoverage(
+                ctx.Rings, tileLeft, tileBottom, ctx.CameraTile, tileSize, forWant: true, detailProbe);
         }
 
-        public static bool ShouldQueueTileProxy(Context ctx, string tileId, int tileRing)
+        public static bool ShouldQueueTileProxy(Context ctx, string tileId, int tileLeft, int tileBottom)
         {
             if (!ShouldKeepTileProxy(ctx, tileId))
                 return false;
 
-            return SpatialStreamingTileRingUtility.ShouldQueueTileProxy(ctx.Rings, tileRing);
+            SpatialTileManifestEntry tile = ctx.Manifest?.FindTile(tileId);
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            var detailProbe = DetailBandProbeForTile(ctx, tile, forWant: false);
+            return SpatialStreamingHlodHandoff.TileInExpandedTileProxyCoverage(
+                ctx.Rings, tileLeft, tileBottom, ctx.CameraTile, tileSize, forWant: false, detailProbe);
         }
 
-        public static bool ShouldWantDetail(int tileRing, Context ctx) =>
-            ctx.Rings.detailRings > 0 &&
-            SpatialStreamingTileRingUtility.ShouldWantDetail(ctx.Rings, tileRing);
+        public static bool ShouldWantDetail(
+            Context ctx,
+            int tileLeft,
+            int tileBottom,
+            int subcellGridX,
+            int subcellGridY)
+        {
+            if (!ctx.HasCameraSubcell || ctx.Rings.detailRings <= 0)
+                return false;
 
-        public static bool ShouldQueueDetail(int tileRing, Context ctx) =>
-            ctx.Rings.detailRings > 0 &&
-            SpatialStreamingTileRingUtility.ShouldQueueDetail(ctx.Rings, tileRing);
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellRing = SpatialStreamingHlodHandoff.GetSubcellRing(
+                tileLeft,
+                tileBottom,
+                subcellGridX,
+                subcellGridY,
+                ctx.CameraSubcell,
+                tileSize,
+                SubcellSizeMeters(ctx));
+            return SpatialStreamingHlodHandoff.ShouldWantDetailForSubcell(ctx.Rings, subcellRing, forWant: true);
+        }
+
+        public static bool ShouldQueueDetail(
+            Context ctx,
+            int tileLeft,
+            int tileBottom,
+            int subcellGridX,
+            int subcellGridY)
+        {
+            if (!ctx.HasCameraSubcell || ctx.Rings.detailRings <= 0)
+                return false;
+
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellRing = SpatialStreamingHlodHandoff.GetSubcellRing(
+                tileLeft,
+                tileBottom,
+                subcellGridX,
+                subcellGridY,
+                ctx.CameraSubcell,
+                tileSize,
+                SubcellSizeMeters(ctx));
+            return SpatialStreamingHlodHandoff.ShouldWantDetailForSubcell(ctx.Rings, subcellRing, forWant: false);
+        }
+
+        public static bool ShouldWantDetail(int tileLeft, int tileBottom, Context ctx) =>
+            false;
+
+        public static bool ShouldQueueDetail(int tileLeft, int tileBottom, Context ctx) =>
+            false;
+
+        public static bool TileWantsMonolithicDetail(
+            Context ctx,
+            int tileLeft,
+            int tileBottom)
+        {
+            if (!ctx.HasCameraSubcell || ctx.Rings.detailRings <= 0)
+                return false;
+
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellSize = SubcellSizeMeters(ctx);
+            int cellsPerEdge = Mathf.Max(1, tileSize / subcellSize);
+            for (int gy = 0; gy < cellsPerEdge; gy++)
+            {
+                for (int gx = 0; gx < cellsPerEdge; gx++)
+                {
+                    if (ShouldWantDetail(ctx, tileLeft, tileBottom, gx, gy))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        public static bool TileQueuesMonolithicDetail(
+            Context ctx,
+            int tileLeft,
+            int tileBottom)
+        {
+            if (!ctx.HasCameraSubcell || ctx.Rings.detailRings <= 0)
+                return false;
+
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
+            int subcellSize = SubcellSizeMeters(ctx);
+            int cellsPerEdge = Mathf.Max(1, tileSize / subcellSize);
+            for (int gy = 0; gy < cellsPerEdge; gy++)
+            {
+                for (int gx = 0; gx < cellsPerEdge; gx++)
+                {
+                    if (ShouldQueueDetail(ctx, tileLeft, tileBottom, gx, gy))
+                        return true;
+                }
+            }
+
+            return false;
+        }
 
         public static int GetLoadPriority(SpatialStreamingLodLevel lodLevel) => lodLevel switch
         {
@@ -387,10 +527,23 @@ namespace ZGConnect.SpatialStreaming
                 return false;
 
             bool usesSubcellProxies = TileUsesSubcellProxies(tile);
-            int tileRing = GetTileRing(ctx, request.TileId);
+            if (!SpatialTileIdUtility.TryParse(request.TileId, out int tileLeft, out int tileBottom))
+                return false;
 
+            int tileSize = ctx.Manifest?.TileSizeMeters ?? 1000;
             if (usesSubcellProxies &&
-                SpatialStreamingTileRingUtility.TileInDetailCoverage(ctx.Rings, tileRing, forWant: false) &&
+                ctx.HasCameraSubcell &&
+                SpatialStreamingHlodHandoff.ShouldWantDetailForSubcell(
+                    ctx.Rings,
+                    SpatialStreamingHlodHandoff.GetSubcellRing(
+                        tileLeft,
+                        tileBottom,
+                        subcell.GridX,
+                        subcell.GridY,
+                        ctx.CameraSubcell,
+                        tileSize,
+                        SubcellSizeMeters(ctx)),
+                    forWant: false) &&
                 !SpatialStreamingRingCoverage.TileHasAllSubcellProxiesLoaded(ctx, tile))
             {
                 return false;
